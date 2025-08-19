@@ -1,15 +1,22 @@
 # llama.cpp for OpenCL
 
-- [Background](#background)
-- [OS](#os)
-- [Hardware](#hardware)
-- [DataType Supports](#datatype-supports)
-- [Model Preparation](#model-preparation)
-- [CMake Options](#cmake-options)
-- [Android](#android)
-- [Windows 11 Arm64](#windows-11-arm64)
-- [Known Issue](#known-issues)
-- [TODO](#todo)
+- [llama.cpp for OpenCL](#llamacpp-for-opencl)
+  - [Background](#background)
+    - [Llama.cpp + OpenCL](#llamacpp--opencl)
+  - [OS](#os)
+  - [Hardware](#hardware)
+    - [Adreno GPU](#adreno-gpu)
+  - [DataType Supports](#datatype-supports)
+  - [Model Preparation](#model-preparation)
+  - [CMake Options](#cmake-options)
+  - [Android](#android)
+    - [I. Setup Environment](#i-setup-environment)
+    - [II. Build llama.cpp](#ii-build-llamacpp)
+  - [Windows 11 Arm64](#windows-11-arm64)
+    - [I. Setup Environment](#i-setup-environment-1)
+    - [II. Build llama.cpp](#ii-build-llamacpp-1)
+  - [Known Issues](#known-issues)
+  - [TODO](#todo)
 
 ## Background
 
@@ -182,6 +189,8 @@ cmake --build . --target install
 
 ### II. Build llama.cpp
 
+There are two ways to build llama.cpp with cmake. One is to use ninja and the other is to use Visual Studio 2022. 
+
 ```powershell
 
 mkdir -p ~/dev/llm
@@ -199,11 +208,35 @@ cmake .. -G Ninja `
 ninja
 ```
 
+Microsoft Visual Studio (MSVC) has been officially supported on Windows on Snapdragon and takes the steps as follows to build it:
+
+```powershell
+
+mkdir -p ~/dev/llm
+cd ~/dev/llm
+
+git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
+mkdir build && cd build
+
+cmake .. -G "Visual Studio 17 2022" -A ARM64 `
+  -DCMAKE_TOOLCHAIN_FILE="$HOME/dev/llm/llama.cpp/cmake/arm64-windows-llvm.cmake" `
+  -DCMAKE_BUILD_TYPE=Release `
+  -DCMAKE_PREFIX_PATH="$HOME/dev/llm/opencl" `
+  -DBUILD_SHARED_LIBS=OFF `
+  -DGGML_OPENCL=ON
+```
+
+This will generate a solution file llama.cpp.sln that can be open and built with Microsof Visual Studio 2022.
+
+You may also need to add `-DLLAMA_CURL=OFF_` to the cmake command if the build encounters an error saying curl is not available.
+
 ## Known Issues
 
-- Currently OpenCL backend does not work on Adreno 6xx GPUs.
+- Currently OpenCL backend may not work on all Adreno 6xx and older GPUs.
 
 ## TODO
 
-- Optimization for Q6_K
-- Support and optimization for Q4_K
+- Optimization for Q6_K.
+- Support and optimization for Q4_K.
+- Add more quantization supports.
+- Performance and power optimization using more advanced features.
