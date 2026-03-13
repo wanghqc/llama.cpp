@@ -28,6 +28,40 @@
 
 #define QK_K       256
 
+#ifdef NVIDIA_GPU
+inline float block_q6_K_dot_y_ref(
+    global uchar * ql,
+    global uchar * qh,
+    global char  * sc,
+    global half  * d,
+    global float * y
+) {
+    const float dv = vload_half(0, d);
+    float sum = 0.0f;
+
+    for (int n = 0; n < QK_K; n += 128) {
+        for (int l = 0; l < 32; ++l) {
+            const int is = l / 16;
+            const int q1 = (int)((ql[l +  0] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+            const int q2 = (int)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+            const int q3 = (int)((ql[l +  0] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+            const int q4 = (int)((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+
+            sum += dv * (float) sc[is + 0] * (float) q1 * y[n + l +  0];
+            sum += dv * (float) sc[is + 2] * (float) q2 * y[n + l + 32];
+            sum += dv * (float) sc[is + 4] * (float) q3 * y[n + l + 64];
+            sum += dv * (float) sc[is + 6] * (float) q4 * y[n + l + 96];
+        }
+
+        ql += 64;
+        qh += 32;
+        sc += 8;
+    }
+
+    return sum;
+}
+#endif
+
 inline float block_q_6_K_dot_y_flat(
     global uchar * blk_ql,
     global uchar * blk_qh,
@@ -79,6 +113,29 @@ inline float block_q_6_K_dot_y_flat(
 
     return sumf;
 }
+
+#ifdef NVIDIA_GPU
+inline float block_q_6_K_dot_y_flat_full(
+    global uchar * blk_ql,
+    global uchar * blk_qh,
+    global char  * blk_scales,
+    global half  * blk_d,
+    global float * yy,
+    int ib
+) {
+    float sumf = 0.0f;
+
+    for (int ip = 0; ip < 2; ++ip) {
+        for (int il = 0; il < 8; ++il) {
+            const int l0 = 4 * il;
+            const int is = 8 * ip + l0 / 16;
+            sumf += block_q_6_K_dot_y_flat(blk_ql, blk_qh, blk_scales, blk_d, yy, ib, ip, is, l0);
+        }
+    }
+
+    return sumf;
+}
+#endif
 
 #undef N_DST
 #undef N_SIMDGROUP
@@ -145,6 +202,49 @@ kernel void kernel_mul_mv_q6_K_f32_flat(
     global char  * blk_scales = (global char  *) src0_s  + offset_src0_s;
     global half  * blk_d      = (global half  *) src0_d  + offset_src0_d;
     global float * yy         = (global float *) src1    + r1*ne10 + im*ne00*ne1;
+
+#ifdef NVIDIA_GPU
+    if (get_local_id(0) != 0 || get_local_id(1) != 0) {
+        return;
+    }
+
+    const int first_row_nv = r0 * N_DST;
+    const ulong offset_src0_nv    = (ulong) first_row_nv * nb + (ulong) (i12/r2) * (nb*ne01) + (ulong) (i13/r3) * (nb*ne01*ne02);
+    global uchar * blk_ql_nv     = (global uchar *) src0_ql + offset_src0_nv * 128;
+    global uchar * blk_qh_nv     = (global uchar *) src0_qh + offset_src0_nv * 64;
+    global char  * blk_scales_nv = (global char  *) src0_s  + offset_src0_nv * 16;
+    global half  * blk_d_nv      = (global half  *) src0_d  + offset_src0_nv;
+    float4 tot_nv = (float4)(0.0f, 0.0f, 0.0f, 0.0f);
+
+    for (int ib = 0; ib < nb; ++ib) {
+        if (first_row_nv + 0 < ne01) {
+            tot_nv.s0 += block_q6_K_dot_y_ref(blk_ql_nv + 0*nb*128 + ib*128, blk_qh_nv + 0*nb*64 + ib*64, blk_scales_nv + 0*nb*16 + ib*16, blk_d_nv + 0*nb + ib, yy + ib * QK_K);
+        }
+        if (first_row_nv + 1 < ne01) {
+            tot_nv.s1 += block_q6_K_dot_y_ref(blk_ql_nv + 1*nb*128 + ib*128, blk_qh_nv + 1*nb*64 + ib*64, blk_scales_nv + 1*nb*16 + ib*16, blk_d_nv + 1*nb + ib, yy + ib * QK_K);
+        }
+        if (first_row_nv + 2 < ne01) {
+            tot_nv.s2 += block_q6_K_dot_y_ref(blk_ql_nv + 2*nb*128 + ib*128, blk_qh_nv + 2*nb*64 + ib*64, blk_scales_nv + 2*nb*16 + ib*16, blk_d_nv + 2*nb + ib, yy + ib * QK_K);
+        }
+        if (first_row_nv + 3 < ne01) {
+            tot_nv.s3 += block_q6_K_dot_y_ref(blk_ql_nv + 3*nb*128 + ib*128, blk_qh_nv + 3*nb*64 + ib*64, blk_scales_nv + 3*nb*16 + ib*16, blk_d_nv + 3*nb + ib, yy + ib * QK_K);
+        }
+    }
+
+    if (first_row_nv + 0 < ne01) {
+        dst[r1*ne0 + im*ne0*ne1 + first_row_nv + 0] = tot_nv.s0;
+    }
+    if (first_row_nv + 1 < ne01) {
+        dst[r1*ne0 + im*ne0*ne1 + first_row_nv + 1] = tot_nv.s1;
+    }
+    if (first_row_nv + 2 < ne01) {
+        dst[r1*ne0 + im*ne0*ne1 + first_row_nv + 2] = tot_nv.s2;
+    }
+    if (first_row_nv + 3 < ne01) {
+        dst[r1*ne0 + im*ne0*ne1 + first_row_nv + 3] = tot_nv.s3;
+    }
+    return;
+#endif
 
     int tid = get_sub_group_local_id()/BLOCK_STRIDE; // first block_stride groups have tid=0
     int ix  = get_sub_group_local_id()%BLOCK_STRIDE; // first block is 0..block_stride-1

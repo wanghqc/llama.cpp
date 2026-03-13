@@ -54,6 +54,26 @@ kernel void kernel_rms_norm(
     float4 sumf = 0;
     float all_sum = 0;
 
+#ifdef NVIDIA_GPU
+    if (get_local_id(0) != 0) {
+        return;
+    }
+
+    float sum_nv = 0.0f;
+    for (int i00 = 0; i00 < ne00; ++i00) {
+        sum_nv += x_scalar[i00] * x_scalar[i00];
+    }
+
+    const float mean_nv  = sum_nv / ne00;
+    const float scale_nv = 1.0f/sqrt(mean_nv + eps);
+
+    global float * y_scalar_nv = dst + i03*ne02*ne01*ne00 + i02*ne01*ne00 + i01*ne00;
+    for (int i00 = 0; i00 < ne00; ++i00) {
+        y_scalar_nv[i00] = x_scalar[i00] * scale_nv;
+    }
+    return;
+#endif
+
     // parallel sum
     for (int i00 = get_local_id(0); i00 < ne00/4; i00 += get_local_size(0)) {
         sumf += x[i00] * x[i00];
@@ -151,6 +171,29 @@ kernel void kernel_rms_norm_mul(
     global float4 * f = (global float4 *) (src1 + (i03%ne13)*nb13 + (i02%ne12)*nb12 + (i01%ne11)*nb11);
 
     float sumf = 0;
+
+#ifdef NVIDIA_GPU
+    if (get_local_id(0) != 0) {
+        return;
+    }
+
+    global float * x_scalar_nv = (global float *) x;
+    global float * f_scalar_nv = (global float *) f;
+    global float * y_scalar_nv = (global float *) (dst + i03*nb3 + i02*nb2 + i01*nb1);
+
+    float sum_nv = 0.0f;
+    for (int i00 = 0; i00 < ne00; ++i00) {
+        sum_nv += x_scalar_nv[i00] * x_scalar_nv[i00];
+    }
+
+    float mean_nv  = sum_nv / ne00;
+    float scale_nv = 1.0f/sqrt(mean_nv + eps);
+
+    for (int i00 = 0; i00 < ne00; ++i00) {
+        y_scalar_nv[i00] = (x_scalar_nv[i00] * scale_nv) * f_scalar_nv[i00 % ne10];
+    }
+    return;
+#endif
 
     // parallel sum
     for (int i00 = get_local_id(0); i00 < ne00/4; i00 += get_local_size(0)) {

@@ -63,6 +63,25 @@ kernel void kernel_mul_mat_f16_f32_l4(
 
     global half4 * x4 = (global half4 *) (src0 + offset_src0);
 
+#ifdef NVIDIA_GPU
+    if (get_local_id(0) != 0) {
+        return;
+    }
+
+    for (int r1 = 0; r1 < nrows; ++r1) {
+        ulong offset_src1 = r1*nb11 + (i12   )*nb12 + (i13   )*nb13;
+
+        float all_sum_nv = 0.0f;
+        for (int i = 0; i < ne00; ++i) {
+            global half  * x_elem = (global half  *) (src0 + offset_src0 + (ulong) i * nb00);
+            global float * y_elem = (global float *) (src1 + offset_src1 + (ulong) i * nb10);
+            all_sum_nv += (float) x_elem[0] * y_elem[0];
+        }
+        dst[im*ne1*ne0 + r1*ne0 + r0] = all_sum_nv;
+    }
+    return;
+#endif
+
     for (int r1 = 0; r1 < nrows; ++r1) {
         ulong offset_src1 = r1*nb11 + (i12   )*nb12 + (i13   )*nb13;
 
@@ -70,10 +89,10 @@ kernel void kernel_mul_mat_f16_f32_l4(
 
         float sumf = 0;
         for (int i = get_sub_group_local_id(); i < ne00/4; i += get_max_sub_group_size()) {
-            sumf += convert_float(x4[i].s0) * y4[i].s0;
-            sumf += convert_float(x4[i].s1) * y4[i].s1;
-            sumf += convert_float(x4[i].s2) * y4[i].s2;
-            sumf += convert_float(x4[i].s3) * y4[i].s3;
+            sumf += (float) x4[i].s0 * y4[i].s0;
+            sumf += (float) x4[i].s1 * y4[i].s1;
+            sumf += (float) x4[i].s2 * y4[i].s2;
+            sumf += (float) x4[i].s3 * y4[i].s3;
         }
 
         float all_sum = sub_group_reduce_add(sumf);

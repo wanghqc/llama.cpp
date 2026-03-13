@@ -45,6 +45,51 @@ typedef struct {
 // each thread in a subgroup processes a block (32 weights)
 #define BLOCK_STRIDE (N_SIMDWIDTH/8)
 
+#ifdef NVIDIA_GPU
+inline void get_scale_min_k4_nv(int j, global uchar * q, uchar * d, uchar * m) {
+    if (j < 4) {
+        *d = q[j] & 63;
+        *m = q[j + 4] & 63;
+    } else {
+        *d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        *m = (q[j + 4] >> 4) | ((q[j - 0] >> 6) << 4);
+    }
+}
+
+inline float block_q4_K_dot_y_ref(global block_q4_K * blk, global float * y) {
+    global uchar * q = blk->qs;
+
+    const float d = vload_half(0, &blk->d);
+    const float minv = vload_half(0, &blk->dmin);
+
+    float sum = 0.0f;
+    int is = 0;
+    uchar sc, m;
+
+    for (int j = 0; j < QK_K; j += 64) {
+        get_scale_min_k4_nv(is + 0, blk->scales, &sc, &m);
+        const float d1 = d * (float) sc;
+        const float m1 = minv * (float) m;
+
+        get_scale_min_k4_nv(is + 1, blk->scales, &sc, &m);
+        const float d2 = d * (float) sc;
+        const float m2 = minv * (float) m;
+
+        for (int l = 0; l < 32; ++l) {
+            sum += (d1 * (float) (q[l] & 0xF) - m1) * y[j + l];
+        }
+        for (int l = 0; l < 32; ++l) {
+            sum += (d2 * (float) (q[l] >> 4) - m2) * y[j + 32 + l];
+        }
+
+        q += 32;
+        is += 2;
+    }
+
+    return sum;
+}
+#endif
+
 #ifdef INTEL_GPU
 REQD_SUBGROUP_SIZE_16
 #elif defined (ADRENO_GPU)
@@ -151,8 +196,8 @@ kernel void kernel_mul_mv_q4_K_f32(
                 acc2.s3 += yh[i+9] * (q2[i/2] & 0xF000);
             }
 
-            float dall = dh[0];
-            float dmin = dh[1];
+            float dall = vload_half(0, dh);
+            float dmin = vload_half(1, dh);
             sumf[row] += dall * ((acc1.s0 + 1.f/256.f * acc1.s1) * sc8[0] +
                                  (acc1.s2 + 1.f/256.f * acc1.s3) * sc8[1] * 1.f/16.f +
                                  (acc2.s0 + 1.f/256.f * acc2.s1) * sc8[4] +
@@ -168,6 +213,29 @@ kernel void kernel_mul_mv_q4_K_f32(
     }
 
     global float * dst_f32 = (global float *) dst + im*ne0*ne1 + r1*ne0;
+
+#ifdef NVIDIA_GPU
+    if (get_local_id(0) != 0 || get_local_id(1) != 0) {
+        return;
+    }
+
+    for (int row = 0; row < N_DST; ++row) {
+        if (first_row + row >= ne01) {
+            continue;
+        }
+
+        ulong offset_src0_row = (ulong)(first_row + row)*nb01 + (ulong)(i12/r2)*nb02 + (ulong)(i13/r3)*nb03;
+        global block_q4_K * x_row = (global block_q4_K *) (src0 + offset_src0_row);
+
+        float total = 0.0f;
+        for (int ib = 0; ib < nb; ++ib) {
+            total += block_q4_K_dot_y_ref(&x_row[ib], y + ib * QK_K);
+        }
+
+        dst_f32[first_row + row] = total;
+    }
+    return;
+#endif
 
     for (int row = 0; row < N_DST; ++row) {
         all_sum = sub_group_reduce_add(sumf[row]);
