@@ -988,12 +988,12 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
         CL_CHECK((backend_ctx->kernel_restore_block_q4_1  = clCreateKernel(backend_ctx->program_cvt, "kernel_restore_block_q4_1", &err), err));
         CL_CHECK((backend_ctx->kernel_convert_block_q5_0  = clCreateKernel(backend_ctx->program_cvt, "kernel_convert_block_q5_0", &err), err));
         CL_CHECK((backend_ctx->kernel_restore_block_q5_0  = clCreateKernel(backend_ctx->program_cvt, "kernel_restore_block_q5_0", &err), err));
+        CL_CHECK((backend_ctx->kernel_convert_block_mxfp4 = clCreateKernel(backend_ctx->program_cvt, "kernel_convert_block_mxfp4", &err), err));
         if (!experimental_nvidia) {
-            CL_CHECK((backend_ctx->kernel_convert_block_mxfp4 = clCreateKernel(backend_ctx->program_cvt, "kernel_convert_block_mxfp4", &err), err));
             CL_CHECK((backend_ctx->kernel_convert_block_mxfp4_trans = clCreateKernel(backend_ctx->program_cvt, "kernel_convert_block_mxfp4_trans", &err), err));
             CL_CHECK((backend_ctx->kernel_restore_block_mxfp4_trans = clCreateKernel(backend_ctx->program_cvt, "kernel_restore_block_mxfp4_trans", &err), err));
-            CL_CHECK((backend_ctx->kernel_restore_block_mxfp4 = clCreateKernel(backend_ctx->program_cvt, "kernel_restore_block_mxfp4", &err), err));
         }
+        CL_CHECK((backend_ctx->kernel_restore_block_mxfp4 = clCreateKernel(backend_ctx->program_cvt, "kernel_restore_block_mxfp4", &err), err));
         CL_CHECK((backend_ctx->kernel_convert_block_q8_0  = clCreateKernel(backend_ctx->program_cvt, "kernel_convert_block_q8_0", &err), err));
         CL_CHECK((backend_ctx->kernel_restore_block_q8_0  = clCreateKernel(backend_ctx->program_cvt, "kernel_restore_block_q8_0", &err), err));
         CL_CHECK((backend_ctx->kernel_restore_block_q8_0_trans  = clCreateKernel(backend_ctx->program_cvt, "kernel_restore_block_q8_0_trans", &err), err));
@@ -1395,37 +1395,33 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
 
     // mul_mv_mxfp4_f32
     {
-        if (!experimental_nvidia) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
-            const std::string kernel_src {
-                #include "mul_mv_mxfp4_f32.cl.h"
-            };
+        const std::string kernel_src {
+            #include "mul_mv_mxfp4_f32.cl.h"
+        };
 #else
-            const std::string kernel_src = read_file("mul_mv_mxfp4_f32.cl");
+        const std::string kernel_src = read_file("mul_mv_mxfp4_f32.cl");
 #endif
-            backend_ctx->program_mul_mv_mxfp4_f32 =
-                build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
+        backend_ctx->program_mul_mv_mxfp4_f32 =
+            build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
 
-            CL_CHECK((backend_ctx->kernel_mul_mv_mxfp4_f32 = clCreateKernel(backend_ctx->program_mul_mv_mxfp4_f32, "kernel_mul_mv_mxfp4_f32", &err), err));
-        }
+        CL_CHECK((backend_ctx->kernel_mul_mv_mxfp4_f32 = clCreateKernel(backend_ctx->program_mul_mv_mxfp4_f32, "kernel_mul_mv_mxfp4_f32", &err), err));
         GGML_LOG_CONT(".");
     }
 
     // mul_mv_mxfp4_f32_flat
     {
-        if (!experimental_nvidia) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
-            const std::string kernel_src {
-                #include "mul_mv_mxfp4_f32_flat.cl.h"
-            };
+        const std::string kernel_src {
+            #include "mul_mv_mxfp4_f32_flat.cl.h"
+        };
 #else
-            const std::string kernel_src = read_file("mul_mv_mxfp4_f32_flat.cl");
+        const std::string kernel_src = read_file("mul_mv_mxfp4_f32_flat.cl");
 #endif
-            backend_ctx->program_mul_mv_mxfp4_f32_flat =
-                build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
+        backend_ctx->program_mul_mv_mxfp4_f32_flat =
+            build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
 
-            CL_CHECK((backend_ctx->kernel_mul_mv_mxfp4_f32_flat = clCreateKernel(backend_ctx->program_mul_mv_mxfp4_f32_flat, "kernel_mul_mv_mxfp4_f32_flat", &err), err));
-        }
+        CL_CHECK((backend_ctx->kernel_mul_mv_mxfp4_f32_flat = clCreateKernel(backend_ctx->program_mul_mv_mxfp4_f32_flat, "kernel_mul_mv_mxfp4_f32_flat", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -2462,37 +2458,33 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
 
     // mul_mv_id_mxfp4_f32
     {
-        if (!experimental_nvidia) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
-            const std::string kernel_src {
-                #include "mul_mv_id_mxfp4_f32.cl.h"
-            };
+        const std::string kernel_src {
+            #include "mul_mv_id_mxfp4_f32.cl.h"
+        };
 #else
-            const std::string kernel_src = read_file("mul_mv_id_mxfp4_f32.cl");
+        const std::string kernel_src = read_file("mul_mv_id_mxfp4_f32.cl");
 #endif
-            backend_ctx->program_mul_mv_id_mxfp4_f32 =
-                build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
+        backend_ctx->program_mul_mv_id_mxfp4_f32 =
+            build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
 
-            CL_CHECK((backend_ctx->kernel_mul_mv_id_mxfp4_f32 = clCreateKernel(backend_ctx->program_mul_mv_id_mxfp4_f32, "kernel_mul_mv_id_mxfp4_f32", &err), err));
-        }
+        CL_CHECK((backend_ctx->kernel_mul_mv_id_mxfp4_f32 = clCreateKernel(backend_ctx->program_mul_mv_id_mxfp4_f32, "kernel_mul_mv_id_mxfp4_f32", &err), err));
         GGML_LOG_CONT(".");
     }
 
     // mul_mv_id_mxfp4_f32_flat
     {
-        if (!experimental_nvidia) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
-            const std::string kernel_src {
-                #include "mul_mv_id_mxfp4_f32_flat.cl.h"
-            };
+        const std::string kernel_src {
+            #include "mul_mv_id_mxfp4_f32_flat.cl.h"
+        };
 #else
-            const std::string kernel_src = read_file("mul_mv_id_mxfp4_f32_flat.cl");
+        const std::string kernel_src = read_file("mul_mv_id_mxfp4_f32_flat.cl");
 #endif
-            backend_ctx->program_mul_mv_id_mxfp4_f32_flat =
-                build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
+        backend_ctx->program_mul_mv_id_mxfp4_f32_flat =
+            build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
 
-            CL_CHECK((backend_ctx->kernel_mul_mv_id_mxfp4_f32_flat = clCreateKernel(backend_ctx->program_mul_mv_id_mxfp4_f32_flat, "kernel_mul_mv_id_mxfp4_f32_flat", &err), err));
-        }
+        CL_CHECK((backend_ctx->kernel_mul_mv_id_mxfp4_f32_flat = clCreateKernel(backend_ctx->program_mul_mv_id_mxfp4_f32_flat, "kernel_mul_mv_id_mxfp4_f32_flat", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -4096,8 +4088,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                        op->src[0]->type == GGML_TYPE_Q6_K) {
                 return op->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
             } else if (op->src[0]->type == GGML_TYPE_MXFP4) {
-                return backend_ctx->device_name.find("NVIDIA") == std::string::npos &&
-                       op->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
+                return op->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
             } else if (op->src[0]->type == GGML_TYPE_Q5_0) {
                 return backend_ctx->device_name.find("NVIDIA") != std::string::npos &&
                        op->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
@@ -4108,7 +4099,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
         case GGML_OP_MUL_MAT_ID:
             if (op->src[0]->type == GGML_TYPE_Q4_0 ||
                 op->src[0]->type == GGML_TYPE_Q8_0 ||
-                (op->src[0]->type == GGML_TYPE_MXFP4 && backend_ctx->device_name.find("NVIDIA") == std::string::npos)) {
+                op->src[0]->type == GGML_TYPE_MXFP4) {
                 if (op->src[1]->type == GGML_TYPE_F32) {
                     return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
                 }
@@ -5010,8 +5001,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         tensor->extra = extra;
         return;
     }
-    if (tensor->type == GGML_TYPE_MXFP4 &&
-        backend_ctx->device_name.find("NVIDIA") == std::string::npos) {
+    if (tensor->type == GGML_TYPE_MXFP4) {
         ggml_tensor_extra_cl * extra_orig = (ggml_tensor_extra_cl *)tensor->extra;
         GGML_ASSERT(extra_orig && "Tesnors in OpenCL backend should have been allocated and initialized");
 
@@ -5735,8 +5725,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
         CL_CHECK(clReleaseMemObject(data_device));
         return;
     }
-    if (tensor->type == GGML_TYPE_MXFP4 &&
-        backend_ctx->device_name.find("NVIDIA") == std::string::npos) {
+    if (tensor->type == GGML_TYPE_MXFP4) {
         ggml_tensor_extra_cl_mxfp4 * extra = (ggml_tensor_extra_cl_mxfp4 *)tensor->extra;
 
         cl_int err;
@@ -11857,7 +11846,13 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             kernel = backend_ctx->kernel_mul_mv_mxfp4_f32_flat;
 
             cl_mem q;
-            if (backend_ctx->gpu_family == INTEL) {
+            if (backend_ctx->device_name.find("NVIDIA") != std::string::npos) {
+                nth0 = 1;
+                nth1 = 1;
+                ndst = 2;
+
+                q = extra0_mxfp4->q;
+            } else if (backend_ctx->gpu_family == INTEL) {
                 nth0 = 16;
                 nth1 = 2;
                 ndst = nth1*2;
