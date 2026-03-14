@@ -1884,7 +1884,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
 
         if (!kernel_src_f16.empty() && !kernel_src_f32.empty() && !kernel_src_f32_f16.empty()) {
             const struct { int dk; int dv; int bm; int bn; } fa_dims[] = {
-                { 40,  40, 32, 32}, { 64,  64, 64, 64}, { 80,  80, 64, 32}, { 96,  96, 64, 32},
+                { 40,  40, 32, 32}, { 64,  64, 32, 32}, { 80,  80, 32, 32}, { 96,  96, 32, 32},
                 {112, 112, 32, 32}, {128, 128, 32, 32}, {192, 128, 16, 16},
                 {192, 192, 16, 16}, {256, 256, 16, 16},
             };
@@ -12265,7 +12265,13 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
             kernel = backend_ctx->kernel_mul_mv_id_mxfp4_f32_flat;
 
             cl_mem q;
-            if (backend_ctx->gpu_family == INTEL) {
+            if (backend_ctx->device_name.find("NVIDIA") != std::string::npos) {
+                sgs  = 1;
+                nsg  = 1;
+                ndst = 2;
+
+                q = extra0_mxfp4->q;
+            } else if (backend_ctx->gpu_family == INTEL) {
                 sgs  = 16;
                 nsg  = 2;
                 ndst = 2;
