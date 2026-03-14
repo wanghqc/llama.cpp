@@ -357,6 +357,56 @@ typedef struct {
     char qs[QK8_0]; // quants
 } block_q8_0;
 
+//------------------------------------------------------------------------------
+// block_q5_0
+//------------------------------------------------------------------------------
+#define QK5_0 32
+typedef struct {
+    half  d;           // delta
+    uchar qh[4];       // 5-th bit of quants
+    uchar qs[QK5_0/2]; // nibbles / quants
+} block_q5_0;
+
+kernel void kernel_convert_block_q5_0(
+    global block_q5_0 * src0,
+    global uchar * dst_q,
+    global uchar * dst_qh,
+    global half  * dst_d
+) {
+    global block_q5_0 * b  = (global block_q5_0 *) src0 + get_global_id(0);
+    global uchar      * q  = (global uchar *) dst_q  + (QK5_0/2)*get_global_id(0);
+    global uchar      * qh = (global uchar *) dst_qh + 4*get_global_id(0);
+    global half       * d  = (global half *)  dst_d  + get_global_id(0);
+
+    *d = b->d;
+    for (int i = 0; i < 4; ++i) {
+        qh[i] = b->qh[i];
+    }
+    for (int i = 0; i < QK5_0/2; ++i) {
+        q[i] = b->qs[i];
+    }
+}
+
+kernel void kernel_restore_block_q5_0(
+    global uchar * src_q,
+    global uchar * src_qh,
+    global half  * src_d,
+    global block_q5_0 * dst
+) {
+    global block_q5_0 * b  = (global block_q5_0 *) dst + get_global_id(0);
+    global uchar      * q  = (global uchar *) src_q  + (QK5_0/2)*get_global_id(0);
+    global uchar      * qh = (global uchar *) src_qh + 4*get_global_id(0);
+    global half       * d  = (global half *)  src_d  + get_global_id(0);
+
+    b->d = *d;
+    for (int i = 0; i < 4; ++i) {
+        b->qh[i] = qh[i];
+    }
+    for (int i = 0; i < QK5_0/2; ++i) {
+        b->qs[i] = q[i];
+    }
+}
+
 kernel void kernel_convert_block_q8_0(
     global block_q8_0 * src0,
     global uchar * dst_q,

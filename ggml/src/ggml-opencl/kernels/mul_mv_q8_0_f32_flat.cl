@@ -36,6 +36,20 @@ typedef struct {
 #define N_SIMDWIDTH 64
 #endif
 
+#ifdef NVIDIA_GPU
+inline float block_q8_0_dot_y_flat_ref(
+    global char * q,
+    global half * d,
+    global float * y
+) {
+    float sum = 0.0f;
+    for (int i = 0; i < QK8_0; ++i) {
+        sum += (float) q[i] * y[i];
+    }
+    return sum * vload_half(0, d);
+}
+#endif
+
 #ifdef INTEL_GPU
 REQD_SUBGROUP_SIZE_16
 #elif defined (ADRENO_GPU)
@@ -78,6 +92,33 @@ kernel void kernel_mul_mv_q8_0_f32_flat(
 
     ulong offset_src1 = r1*nb11 + i12*nb12 + i13*nb13;
     global float * y  = (global float *) (src1 + offset_src1);
+
+#ifdef NVIDIA_GPU
+    if (get_local_id(0) != 0 || get_local_id(1) != 0) {
+        return;
+    }
+
+    const int first_row_nv = r0 * N_R0_Q8_0;
+    global float * dst_f32_nv = (global float *) dst + (ulong) im*ne0*ne1 + (ulong) r1*ne0;
+
+    for (int row = 0; row < N_R0_Q8_0; ++row) {
+        if (first_row_nv + row >= ne01) {
+            continue;
+        }
+
+        uint offset_src0 = ((first_row_nv + row)*nb01 + (i12/r2)*nb02 + (i13/r3)*nb03) / 34;
+        global char * ax = (global char *) ((global char *) src0_q + offset_src0*sizeof(char)*QK8_0);
+        global half * ad = (global half *) ((global char *) src0_d + offset_src0*sizeof(half));
+
+        float total = 0.0f;
+        for (int ib = 0; ib < nb; ++ib) {
+            total += block_q8_0_dot_y_flat_ref(ax + ib*sizeof(char)*QK8_0, ad + ib, y + ib*QK8_0);
+        }
+
+        dst_f32_nv[first_row_nv + row] = total;
+    }
+    return;
+#endif
 
     // pointers to src0 rows
     uint offset_src0_base = first_row*nb01 + (i12/r2)*nb02 + (i13/r3)*nb03;

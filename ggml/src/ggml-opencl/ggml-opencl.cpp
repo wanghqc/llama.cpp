@@ -436,6 +436,7 @@ struct ggml_backend_opencl_context {
     cl_program program_mul_mv_q4_0_f32_1d_8x_flat;
     cl_program program_mul_mv_q4_0_f32_1d_16x_flat;
     cl_program program_mul_mv_q6_K;
+    cl_program program_mul_mv_q5_0_f32_flat;
     cl_program program_mul_mv_q8_0_f32, program_mul_mv_q8_0_f32_flat;
     cl_program program_mul_mv_mxfp4_f32;
     cl_program program_mul_mv_mxfp4_f32_flat;
@@ -530,6 +531,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mat_q4_0_f32, kernel_mul_mat_q4_0_f32_v;
     cl_kernel kernel_convert_block_q4_0, kernel_restore_block_q4_0;
     cl_kernel kernel_convert_block_q4_1, kernel_restore_block_q4_1;
+    cl_kernel kernel_convert_block_q5_0, kernel_restore_block_q5_0;
     cl_kernel kernel_convert_block_mxfp4, kernel_convert_block_mxfp4_trans, kernel_restore_block_mxfp4, kernel_restore_block_mxfp4_trans;
     cl_kernel kernel_convert_block_q8_0, kernel_restore_block_q8_0, kernel_restore_block_q8_0_trans;
     cl_kernel kernel_convert_block_q6_K_noshuffle, kernel_restore_block_q6_K_noshuffle;
@@ -545,6 +547,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mat_q4_0_f32_1d_8x_flat, kernel_mul_mat_q4_0_f32_1d_16x_flat;
     cl_kernel kernel_mul_mv_q4_1_f32;
     cl_kernel kernel_mul_mv_q4_1_f32_flat;
+    cl_kernel kernel_mul_mv_q5_0_f32_flat;
     cl_kernel kernel_mul_mv_q4_K_f32;
     cl_kernel kernel_mul_mv_q4_K_f32_flat;
     cl_kernel kernel_mul_mv_q6_K_f32;
@@ -983,6 +986,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
         CL_CHECK((backend_ctx->kernel_restore_block_q4_1_noshuffle = clCreateKernel(backend_ctx->program_cvt, "kernel_restore_block_q4_1_noshuffle", &err), err));
         CL_CHECK((backend_ctx->kernel_convert_block_q4_1  = clCreateKernel(backend_ctx->program_cvt, "kernel_convert_block_q4_1", &err), err));
         CL_CHECK((backend_ctx->kernel_restore_block_q4_1  = clCreateKernel(backend_ctx->program_cvt, "kernel_restore_block_q4_1", &err), err));
+        CL_CHECK((backend_ctx->kernel_convert_block_q5_0  = clCreateKernel(backend_ctx->program_cvt, "kernel_convert_block_q5_0", &err), err));
+        CL_CHECK((backend_ctx->kernel_restore_block_q5_0  = clCreateKernel(backend_ctx->program_cvt, "kernel_restore_block_q5_0", &err), err));
         if (!experimental_nvidia) {
             CL_CHECK((backend_ctx->kernel_convert_block_mxfp4 = clCreateKernel(backend_ctx->program_cvt, "kernel_convert_block_mxfp4", &err), err));
             CL_CHECK((backend_ctx->kernel_convert_block_mxfp4_trans = clCreateKernel(backend_ctx->program_cvt, "kernel_convert_block_mxfp4_trans", &err), err));
@@ -1369,6 +1374,22 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
             build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mv_q8_0_f32_flat = clCreateKernel(backend_ctx->program_mul_mv_q8_0_f32_flat, "kernel_mul_mv_q8_0_f32_flat", &err), err));
+        GGML_LOG_CONT(".");
+    }
+
+    // mul_mv_q5_0_f32_flat
+    {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "mul_mv_q5_0_f32_flat.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("mul_mv_q5_0_f32_flat.cl");
+#endif
+        backend_ctx->program_mul_mv_q5_0_f32_flat =
+            build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
+
+        CL_CHECK((backend_ctx->kernel_mul_mv_q5_0_f32_flat = clCreateKernel(backend_ctx->program_mul_mv_q5_0_f32_flat, "kernel_mul_mv_q5_0_f32_flat", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -3514,6 +3535,38 @@ struct ggml_tensor_extra_cl_q4_1 {
     }
 };
 
+struct ggml_tensor_extra_cl_q5_0 {
+    cl_mem q = nullptr;
+    cl_mem qh = nullptr;
+    cl_mem d = nullptr;
+
+    size_t size_q = 0;
+    size_t size_qh = 0;
+    size_t size_d = 0;
+
+    ~ggml_tensor_extra_cl_q5_0() {
+        reset();
+    }
+
+    void reset() {
+        if (q != nullptr) {
+            CL_CHECK(clReleaseMemObject(q));
+            q = nullptr;
+        }
+        if (qh != nullptr) {
+            CL_CHECK(clReleaseMemObject(qh));
+            qh = nullptr;
+        }
+        if (d != nullptr) {
+            CL_CHECK(clReleaseMemObject(d));
+            d = nullptr;
+        }
+        size_q = 0;
+        size_qh = 0;
+        size_d = 0;
+    }
+};
+
 struct ggml_tensor_extra_cl_mxfp4 {
     // Quantized values.
     cl_mem q = nullptr;
@@ -4043,6 +4096,9 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                        op->src[0]->type == GGML_TYPE_Q4_K  ||
                        op->src[0]->type == GGML_TYPE_Q6_K) {
                 return op->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
+            } else if (op->src[0]->type == GGML_TYPE_Q5_0) {
+                return backend_ctx->device_name.find("NVIDIA") != std::string::npos &&
+                       op->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
             } else if (op->src[0]->type == GGML_TYPE_Q8_0) {
                 return op->src[1]->type == GGML_TYPE_F32;
             }
@@ -4224,6 +4280,12 @@ struct ggml_backend_opencl_buffer_context {
         for (ggml_tensor_extra_cl_q4_0 * e : temp_tensor_extras_q4_0_in_use) {
             delete e;
         }
+        for (ggml_tensor_extra_cl_q5_0 * e : temp_tensor_extras_q5_0) {
+            delete e;
+        }
+        for (ggml_tensor_extra_cl_q5_0 * e : temp_tensor_extras_q5_0_in_use) {
+            delete e;
+        }
         for (ggml_tensor_extra_cl_mxfp4 * e : temp_tensor_extras_mxfp4) {
             delete e;
         }
@@ -4290,6 +4352,21 @@ struct ggml_backend_opencl_buffer_context {
         }
 
         temp_tensor_extras_q4_1_in_use.push_back(extra);
+
+        extra->reset();
+        return extra;
+    }
+
+    ggml_tensor_extra_cl_q5_0 * ggml_opencl_alloc_temp_tensor_extra_q5_0() {
+        ggml_tensor_extra_cl_q5_0 * extra;
+        if (temp_tensor_extras_q5_0.empty()) {
+            extra = new ggml_tensor_extra_cl_q5_0();
+        } else {
+            extra = temp_tensor_extras_q5_0.back();
+            temp_tensor_extras_q5_0.pop_back();
+        }
+
+        temp_tensor_extras_q5_0_in_use.push_back(extra);
 
         extra->reset();
         return extra;
@@ -4371,6 +4448,11 @@ struct ggml_backend_opencl_buffer_context {
         }
         temp_tensor_extras_q4_1_in_use.clear();
 
+        for (ggml_tensor_extra_cl_q5_0 * e : temp_tensor_extras_q5_0_in_use) {
+            temp_tensor_extras_q5_0.push_back(e);
+        }
+        temp_tensor_extras_q5_0_in_use.clear();
+
         for (ggml_tensor_extra_cl_mxfp4 * e : temp_tensor_extras_mxfp4_in_use) {
             temp_tensor_extras_mxfp4.push_back(e);
         }
@@ -4403,6 +4485,8 @@ struct ggml_backend_opencl_buffer_context {
     std::vector<ggml_tensor_extra_cl_q4_0 *> temp_tensor_extras_q4_0_in_use;
     std::vector<ggml_tensor_extra_cl_q4_1 *> temp_tensor_extras_q4_1;
     std::vector<ggml_tensor_extra_cl_q4_1 *> temp_tensor_extras_q4_1_in_use;
+    std::vector<ggml_tensor_extra_cl_q5_0 *> temp_tensor_extras_q5_0;
+    std::vector<ggml_tensor_extra_cl_q5_0 *> temp_tensor_extras_q5_0_in_use;
     std::vector<ggml_tensor_extra_cl_mxfp4 *> temp_tensor_extras_mxfp4;
     std::vector<ggml_tensor_extra_cl_mxfp4 *> temp_tensor_extras_mxfp4_in_use;
     std::vector<ggml_tensor_extra_cl_q8_0 *> temp_tensor_extras_q8_0;
@@ -4865,6 +4949,63 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
             transpose_2d_as_16b(backend_ctx, extra->m, extra->m, size_m, K/32, M);
         }
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
+        return;
+    }
+    if (tensor->type == GGML_TYPE_Q5_0) {
+        ggml_tensor_extra_cl * extra_orig = (ggml_tensor_extra_cl *)tensor->extra;
+        GGML_ASSERT(extra_orig && "Tesnors in OpenCL backend should have been allocated and initialized");
+
+        ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
+        ggml_tensor_extra_cl_q5_0 * extra = ctx->ggml_opencl_alloc_temp_tensor_extra_q5_0();
+
+        size_t size_d  = ggml_nelements(tensor)/ggml_blck_size(tensor->type)*sizeof(ggml_fp16_t);
+        size_t size_qh = ggml_nelements(tensor)/ggml_blck_size(tensor->type)*sizeof(uint32_t);
+        size_t size_q  = ggml_nelements(tensor)/ggml_blck_size(tensor->type)*(ggml_blck_size(tensor->type)/2);
+        GGML_ASSERT(size_d + size_qh + size_q == ggml_nbytes(tensor) && "Incorrect tensor size");
+
+        cl_int err;
+        cl_mem data_device = clCreateBuffer(context, CL_MEM_READ_WRITE, ggml_nbytes(tensor), NULL, &err);
+        CL_CHECK(err);
+        CL_CHECK(clEnqueueWriteBuffer(queue, data_device, CL_TRUE, 0, ggml_nbytes(tensor), data, 0, NULL, NULL));
+
+        cl_buffer_region region;
+
+        region.origin = align_to(extra_orig->offset + tensor->view_offs + offset, backend_ctx->alignment);
+        region.size = size_d;
+        extra->d = clCreateSubBuffer(extra_orig->data_device, CL_MEM_READ_WRITE, CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
+        CL_CHECK(err);
+        auto previous_origin = region.origin;
+
+        region.origin = align_to(previous_origin + size_d, backend_ctx->alignment);
+        region.size = size_qh;
+        extra->qh = clCreateSubBuffer(extra_orig->data_device, CL_MEM_READ_WRITE, CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
+        CL_CHECK(err);
+        previous_origin = region.origin;
+
+        region.origin = align_to(previous_origin + size_qh, backend_ctx->alignment);
+        region.size = size_q;
+        extra->q = clCreateSubBuffer(extra_orig->data_device, CL_MEM_READ_WRITE, CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
+        CL_CHECK(err);
+
+        cl_kernel kernel = backend_ctx->kernel_convert_block_q5_0;
+
+        CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &data_device));
+        CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &extra->q));
+        CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &extra->qh));
+        CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem), &extra->d));
+
+        size_t global_work_size[] = {(size_t) ggml_nelements(tensor)/ggml_blck_size(tensor->type), 1, 1};
+        size_t local_work_size[] = {64, 1, 1};
+
+        cl_event evt;
+        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+        CL_CHECK(clWaitForEvents(1, &evt));
+        CL_CHECK(clReleaseMemObject(data_device));
+
+        extra->size_d = size_d;
+        extra->size_qh = size_qh;
+        extra->size_q = size_q;
+        tensor->extra = extra;
         return;
     }
     if (tensor->type == GGML_TYPE_MXFP4) {
@@ -5565,6 +5706,29 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
         CL_CHECK(clEnqueueReadBuffer(
             queue, data_device, CL_TRUE, offset,
             size, data, 0, NULL, NULL));
+        CL_CHECK(clReleaseMemObject(data_device));
+        return;
+    }
+    if (tensor->type == GGML_TYPE_Q5_0) {
+        ggml_tensor_extra_cl_q5_0 * extra = (ggml_tensor_extra_cl_q5_0 *)tensor->extra;
+
+        cl_int err;
+        cl_mem data_device = clCreateBuffer(context, CL_MEM_READ_WRITE, ggml_nbytes(tensor), NULL, &err);
+        CL_CHECK(err);
+
+        cl_kernel kernel = backend_ctx->kernel_restore_block_q5_0;
+        CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &extra->q));
+        CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &extra->qh));
+        CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &extra->d));
+        CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem), &data_device));
+
+        size_t global_work_size[] = {(size_t) ggml_nelements(tensor)/ggml_blck_size(tensor->type), 1, 1};
+        size_t local_work_size[] = {1, 1, 1};
+
+        cl_event evt;
+        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+        CL_CHECK(clWaitForEvents(1, &evt));
+        CL_CHECK(clEnqueueReadBuffer(queue, data_device, CL_TRUE, offset, size, data, 0, NULL, NULL));
         CL_CHECK(clReleaseMemObject(data_device));
         return;
     }
@@ -10306,6 +10470,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 #ifdef GGML_OPENCL_SOA_Q
     ggml_tensor_extra_cl_q4_0 * extra0_q4_0 = (ggml_tensor_extra_cl_q4_0 *)src0->extra;
     ggml_tensor_extra_cl_q4_1 * extra0_q4_1 = (ggml_tensor_extra_cl_q4_1 *)src0->extra;
+    ggml_tensor_extra_cl_q5_0 * extra0_q5_0 = (ggml_tensor_extra_cl_q5_0 *)src0->extra;
     ggml_tensor_extra_cl_mxfp4 * extra0_mxfp4 = (ggml_tensor_extra_cl_mxfp4 *)src0->extra;
     ggml_tensor_extra_cl_q8_0 * extra0_q8_0 = (ggml_tensor_extra_cl_q8_0 *)src0->extra;
     ggml_tensor_extra_cl_q4_K * extra0_q4_K = (ggml_tensor_extra_cl_q4_K *)src0->extra;
@@ -11380,6 +11545,40 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 #endif // GGML_OPENCL_SOA_Q
             break;
         }
+        case GGML_TYPE_Q5_0: {
+#ifdef GGML_OPENCL_SOA_Q
+            GGML_ASSERT(backend_ctx->device_name.find("NVIDIA") != std::string::npos);
+
+            kernel = backend_ctx->kernel_mul_mv_q5_0_f32_flat;
+            nth0 = 1;
+            nth1 = 1;
+            ndst = 4;
+
+            CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0_q5_0->q));
+            CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_mem),   &extra0_q5_0->qh));
+            CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &extra0_q5_0->d));
+            CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_mem),   &extra1->data_device));
+            CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_ulong), &offset1));
+            CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_mem),   &extrad->data_device));
+            CL_CHECK(clSetKernelArg(kernel,  6, sizeof(cl_ulong), &offsetd));
+            CL_CHECK(clSetKernelArg(kernel,  7, sizeof(int),      &ne00));
+            CL_CHECK(clSetKernelArg(kernel,  8, sizeof(int),      &ne01));
+            CL_CHECK(clSetKernelArg(kernel,  9, sizeof(cl_ulong), &nb01));
+            CL_CHECK(clSetKernelArg(kernel, 10, sizeof(cl_ulong), &nb02));
+            CL_CHECK(clSetKernelArg(kernel, 11, sizeof(cl_ulong), &nb03));
+            CL_CHECK(clSetKernelArg(kernel, 12, sizeof(int),      &ne12));
+            CL_CHECK(clSetKernelArg(kernel, 13, sizeof(cl_ulong), &nb11));
+            CL_CHECK(clSetKernelArg(kernel, 14, sizeof(cl_ulong), &nb12));
+            CL_CHECK(clSetKernelArg(kernel, 15, sizeof(cl_ulong), &nb13));
+            CL_CHECK(clSetKernelArg(kernel, 16, sizeof(int),      &ne0));
+            CL_CHECK(clSetKernelArg(kernel, 17, sizeof(int),      &ne1));
+            CL_CHECK(clSetKernelArg(kernel, 18, sizeof(int),      &r2));
+            CL_CHECK(clSetKernelArg(kernel, 19, sizeof(int),      &r3));
+#else
+            GGML_ASSERT(false && "Q5_0 OpenCL matmul requires GGML_OPENCL_SOA_Q");
+#endif
+            break;
+        }
         case GGML_TYPE_Q8_0: {
 #ifdef GGML_OPENCL_SOA_Q
             kernel = backend_ctx->kernel_mul_mv_q8_0_f32_flat;
@@ -11387,7 +11586,11 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             // nth0 - subgroup size
             // nth1 - number of subgroups per workgroup
             // ndst - number of output values per workgroup = output per subgroup * number of subgroups
-            if (backend_ctx->gpu_family == INTEL) {
+            if (backend_ctx->device_name.find("NVIDIA") != std::string::npos) {
+                nth0 = 1;
+                nth1 = 1;
+                ndst = 4;
+            } else if (backend_ctx->gpu_family == INTEL) {
                 nth0 = 16;
                 nth1 = 2;
                 ndst = nth1*4;
