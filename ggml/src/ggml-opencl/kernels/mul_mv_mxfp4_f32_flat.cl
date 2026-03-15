@@ -61,7 +61,7 @@ constant static float kvalues_mxfp4_f[16] = {
 #ifdef NVIDIA_GPU
 static inline float block_mxfp4_dot_y_ref(global uchar * q, uchar e, global float * y) {
     float sum = 0.0f;
-    const float d = 0.5f * e8m0_to_fp32(e);
+    const float d = e8m0_to_fp32(e);
     for (int i = 0; i < QK_MXFP4/2; ++i) {
         const uchar packed = q[i];
         sum += kvalues_mxfp4_f[packed & 0x0F] * y[i];
