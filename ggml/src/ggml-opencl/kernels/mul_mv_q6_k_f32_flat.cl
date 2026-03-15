@@ -28,39 +28,6 @@
 
 #define QK_K       256
 
-#ifdef NVIDIA_GPU
-inline float block_q6_K_dot_y_ref(
-    global uchar * ql,
-    global uchar * qh,
-    global char  * sc,
-    global half  * d,
-    global float * y
-) {
-    const float dv = vload_half(0, d);
-    float sum = 0.0f;
-
-    for (int n = 0; n < QK_K; n += 128) {
-        for (int l = 0; l < 32; ++l) {
-            const int is = l / 16;
-            const int q1 = (int)((ql[l +  0] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
-            const int q2 = (int)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
-            const int q3 = (int)((ql[l +  0] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
-            const int q4 = (int)((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
-
-            sum += dv * (float) sc[is + 0] * (float) q1 * y[n + l +  0];
-            sum += dv * (float) sc[is + 2] * (float) q2 * y[n + l + 32];
-            sum += dv * (float) sc[is + 4] * (float) q3 * y[n + l + 64];
-            sum += dv * (float) sc[is + 6] * (float) q4 * y[n + l + 96];
-        }
-
-        ql += 64;
-        qh += 32;
-        sc += 8;
-    }
-
-    return sum;
-}
-#endif
 
 inline float block_q_6_K_dot_y_flat(
     global uchar * blk_ql,
@@ -84,7 +51,7 @@ inline float block_q_6_K_dot_y_flat(
 
     global float * y = yy + ib * QK_K + y_offset;
 
-    float dall = blk_d[ib];
+    float dall = vload_half(0, blk_d + ib);
 
     float  sumf = 0;
     float4 sums = {0.f, 0.f, 0.f, 0.f};
@@ -114,28 +81,6 @@ inline float block_q_6_K_dot_y_flat(
     return sumf;
 }
 
-#ifdef NVIDIA_GPU
-inline float block_q_6_K_dot_y_flat_full(
-    global uchar * blk_ql,
-    global uchar * blk_qh,
-    global char  * blk_scales,
-    global half  * blk_d,
-    global float * yy,
-    int ib
-) {
-    float sumf = 0.0f;
-
-    for (int ip = 0; ip < 2; ++ip) {
-        for (int il = 0; il < 8; ++il) {
-            const int l0 = 4 * il;
-            const int is = 8 * ip + l0 / 16;
-            sumf += block_q_6_K_dot_y_flat(blk_ql, blk_qh, blk_scales, blk_d, yy, ib, ip, is, l0);
-        }
-    }
-
-    return sumf;
-}
-#endif
 
 #undef N_DST
 #undef N_SIMDGROUP
@@ -149,6 +94,14 @@ inline float block_q_6_K_dot_y_flat_full(
 #define N_DST 4
 #define N_SIMDGROUP 2
 #define N_SIMDWIDTH 64
+#endif
+
+// NVIDIA: warp width = 32; N_SIMDGROUP=1 (one warp per WG, __local reduction)
+#ifdef NVIDIA_GPU
+#undef N_SIMDWIDTH
+#define N_SIMDWIDTH 32
+#undef N_SIMDGROUP
+#define N_SIMDGROUP 1
 #endif
 
 #define BLOCK_STRIDE (N_SIMDWIDTH/16) // number of blocks each subgroup processes
@@ -203,49 +156,6 @@ kernel void kernel_mul_mv_q6_K_f32_flat(
     global half  * blk_d      = (global half  *) src0_d  + offset_src0_d;
     global float * yy         = (global float *) src1    + r1*ne10 + im*ne00*ne1;
 
-#ifdef NVIDIA_GPU
-    if (get_local_id(0) != 0 || get_local_id(1) != 0) {
-        return;
-    }
-
-    const int first_row_nv = r0 * N_DST;
-    const ulong offset_src0_nv    = (ulong) first_row_nv * nb + (ulong) (i12/r2) * (nb*ne01) + (ulong) (i13/r3) * (nb*ne01*ne02);
-    global uchar * blk_ql_nv     = (global uchar *) src0_ql + offset_src0_nv * 128;
-    global uchar * blk_qh_nv     = (global uchar *) src0_qh + offset_src0_nv * 64;
-    global char  * blk_scales_nv = (global char  *) src0_s  + offset_src0_nv * 16;
-    global half  * blk_d_nv      = (global half  *) src0_d  + offset_src0_nv;
-    float4 tot_nv = (float4)(0.0f, 0.0f, 0.0f, 0.0f);
-
-    for (int ib = 0; ib < nb; ++ib) {
-        if (first_row_nv + 0 < ne01) {
-            tot_nv.s0 += block_q6_K_dot_y_ref(blk_ql_nv + 0*nb*128 + ib*128, blk_qh_nv + 0*nb*64 + ib*64, blk_scales_nv + 0*nb*16 + ib*16, blk_d_nv + 0*nb + ib, yy + ib * QK_K);
-        }
-        if (first_row_nv + 1 < ne01) {
-            tot_nv.s1 += block_q6_K_dot_y_ref(blk_ql_nv + 1*nb*128 + ib*128, blk_qh_nv + 1*nb*64 + ib*64, blk_scales_nv + 1*nb*16 + ib*16, blk_d_nv + 1*nb + ib, yy + ib * QK_K);
-        }
-        if (first_row_nv + 2 < ne01) {
-            tot_nv.s2 += block_q6_K_dot_y_ref(blk_ql_nv + 2*nb*128 + ib*128, blk_qh_nv + 2*nb*64 + ib*64, blk_scales_nv + 2*nb*16 + ib*16, blk_d_nv + 2*nb + ib, yy + ib * QK_K);
-        }
-        if (first_row_nv + 3 < ne01) {
-            tot_nv.s3 += block_q6_K_dot_y_ref(blk_ql_nv + 3*nb*128 + ib*128, blk_qh_nv + 3*nb*64 + ib*64, blk_scales_nv + 3*nb*16 + ib*16, blk_d_nv + 3*nb + ib, yy + ib * QK_K);
-        }
-    }
-
-    if (first_row_nv + 0 < ne01) {
-        dst[r1*ne0 + im*ne0*ne1 + first_row_nv + 0] = tot_nv.s0;
-    }
-    if (first_row_nv + 1 < ne01) {
-        dst[r1*ne0 + im*ne0*ne1 + first_row_nv + 1] = tot_nv.s1;
-    }
-    if (first_row_nv + 2 < ne01) {
-        dst[r1*ne0 + im*ne0*ne1 + first_row_nv + 2] = tot_nv.s2;
-    }
-    if (first_row_nv + 3 < ne01) {
-        dst[r1*ne0 + im*ne0*ne1 + first_row_nv + 3] = tot_nv.s3;
-    }
-    return;
-#endif
-
     int tid = get_sub_group_local_id()/BLOCK_STRIDE; // first block_stride groups have tid=0
     int ix  = get_sub_group_local_id()%BLOCK_STRIDE; // first block is 0..block_stride-1
     int ip  = tid/8;   // first or second half of (super) block (0 or 1)
@@ -271,6 +181,26 @@ kernel void kernel_mul_mv_q6_K_f32_flat(
         }
     }
 
+#ifdef NVIDIA_GPU
+    // cl_khr_subgroups unavailable on NVIDIA OpenCL: use __local tree-reduction.
+    // N_SIMDWIDTH==32 (warp), N_SIMDGROUP==1, local size = 32x1.
+    __local float4 lm[N_SIMDWIDTH];
+    int lid = get_local_id(0);
+    lm[lid] = sumf;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int s = N_SIMDWIDTH / 2; s > 0; s >>= 1) {
+        if (lid < s) {
+            lm[lid] += lm[lid + s];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (lid == 0) {
+        if (first_row + 0 < ne01) { dst[r1*ne0 + im*ne0*ne1 + first_row + 0] = lm[0].s0; }
+        if (first_row + 1 < ne01) { dst[r1*ne0 + im*ne0*ne1 + first_row + 1] = lm[0].s1; }
+        if (first_row + 2 < ne01) { dst[r1*ne0 + im*ne0*ne1 + first_row + 2] = lm[0].s2; }
+        if (first_row + 3 < ne01) { dst[r1*ne0 + im*ne0*ne1 + first_row + 3] = lm[0].s3; }
+    }
+#else
     float4 tot = (float4)(
         sub_group_reduce_add(sumf.s0),
         sub_group_reduce_add(sumf.s1),
@@ -278,17 +208,10 @@ kernel void kernel_mul_mv_q6_K_f32_flat(
         sub_group_reduce_add(sumf.s3)
     );
     if (get_sub_group_local_id() == 0) {
-        if (first_row + 0 < ne01) {
-            dst[r1*ne0 + im*ne0*ne1 + first_row + 0] = tot.s0;
-        }
-        if (first_row + 1 < ne01) {
-            dst[r1*ne0 + im*ne0*ne1 + first_row + 1] = tot.s1;
-        }
-        if (first_row + 2 < ne01) {
-            dst[r1*ne0 + im*ne0*ne1 + first_row + 2] = tot.s2;
-        }
-        if (first_row + 3 < ne01) {
-            dst[r1*ne0 + im*ne0*ne1 + first_row + 3] = tot.s3;
-        }
+        if (first_row + 0 < ne01) { dst[r1*ne0 + im*ne0*ne1 + first_row + 0] = tot.s0; }
+        if (first_row + 1 < ne01) { dst[r1*ne0 + im*ne0*ne1 + first_row + 1] = tot.s1; }
+        if (first_row + 2 < ne01) { dst[r1*ne0 + im*ne0*ne1 + first_row + 2] = tot.s2; }
+        if (first_row + 3 < ne01) { dst[r1*ne0 + im*ne0*ne1 + first_row + 3] = tot.s3; }
     }
+#endif
 }

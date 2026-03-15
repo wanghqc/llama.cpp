@@ -834,6 +834,10 @@ static cl_program build_program_from_source(cl_context ctx, cl_device_id dev, co
             "#ifndef REQD_SUBGROUP_SIZE_128\n"
             "#define REQD_SUBGROUP_SIZE_128\n"
             "#endif\n"
+            // sub_group builtins: map lane/warp operations to workgroup equivalents.
+            // get_sub_group_local_id → get_local_id(0): correct when nth0==warp width
+            // get_sub_group_id → 0: correct when N_SIMDGROUP==1 (one warp per WG)
+            // sub_group_reduce_add: NOT stubbed here; NVIDIA paths use __local reduction.
             "#ifndef get_sub_group_id\n"
             "#define get_sub_group_id() (0)\n"
             "#endif\n"
@@ -849,6 +853,9 @@ static cl_program build_program_from_source(cl_context ctx, cl_device_id dev, co
             "#ifndef get_num_sub_groups\n"
             "#define get_num_sub_groups() (1)\n"
             "#endif\n"
+            // sub_group_reduce_add / sub_group_broadcast: keep identity stubs only for
+            // kernels that run with nth0=1 (single-thread WG). Hot kernels (Q4_K, Q6_K)
+            // override this with explicit __local tree-reduction inside NVIDIA_GPU blocks.
             "#ifndef sub_group_reduce_add\n"
             "#define sub_group_reduce_add(x) (x)\n"
             "#endif\n"
@@ -5493,31 +5500,20 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         CL_CHECK((data_device = clCreateBuffer(context, CL_MEM_READ_WRITE, ggml_nbytes(tensor), NULL, &err), err));
         CL_CHECK(clEnqueueWriteBuffer(queue, data_device, CL_TRUE, 0, ggml_nbytes(tensor), data, 0, NULL, NULL));
 
-        cl_buffer_region region;
-
-        // Subbuffer for ql
-        region.origin = align_to(extra_orig->offset + tensor->view_offs + offset, backend_ctx->alignment);
-        region.size = size_ql;
-        CL_CHECK((extra->ql = clCreateSubBuffer(extra_orig->data_device, CL_MEM_READ_WRITE, CL_BUFFER_CREATE_TYPE_REGION, &region, &err), err));
-        auto previous_origin = region.origin;
-
-        // Subbuffer for qh
-        region.origin = align_to(previous_origin + size_ql, backend_ctx->alignment);
-        region.size = size_qh;
-        CL_CHECK((extra->qh = clCreateSubBuffer(extra_orig->data_device, CL_MEM_READ_WRITE, CL_BUFFER_CREATE_TYPE_REGION, &region, &err), err));
-        previous_origin = region.origin;
-
-        // Subbuffer for scales
-        region.origin = align_to(previous_origin + size_qh, backend_ctx->alignment);
-        region.size = size_s;
-        CL_CHECK((extra->s = clCreateSubBuffer(extra_orig->data_device, CL_MEM_READ_WRITE, CL_BUFFER_CREATE_TYPE_REGION, &region, &err), err));
-        previous_origin = region.origin;
-
-        // Create subbuffer for d.
-        region.origin = align_to(previous_origin + size_s, backend_ctx->alignment);
-        region.size = size_d;
-        CL_CHECK((extra->d = clCreateSubBuffer(extra_orig->data_device, CL_MEM_READ_WRITE, CL_BUFFER_CREATE_TYPE_REGION, &region, &err), err));
-        previous_origin = region.origin;
+        // Allocate separate buffers for each SoA component.
+        // We do not use subbuffers of the original tensor buffer here because
+        // subbuffers require aligned origins, and the cumulative alignment gaps
+        // can push a subbuffer origin past the tensor's allocated region,
+        // causing it to alias into an adjacent tensor's memory (which would
+        // then corrupt the SoA data when that tensor is written).
+        extra->ql = clCreateBuffer(context, CL_MEM_READ_WRITE, size_ql, NULL, &err);
+        CL_CHECK(err);
+        extra->qh = clCreateBuffer(context, CL_MEM_READ_WRITE, size_qh, NULL, &err);
+        CL_CHECK(err);
+        extra->s  = clCreateBuffer(context, CL_MEM_READ_WRITE, size_s,  NULL, &err);
+        CL_CHECK(err);
+        extra->d  = clCreateBuffer(context, CL_MEM_READ_WRITE, size_d,  NULL, &err);
+        CL_CHECK(err);
 
         // Flatten the weights
         cl_kernel kernel;
@@ -5540,13 +5536,19 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         CL_CHECK(clSetKernelArg(kernel, 5, sizeof(cl_uchar), &mask));
         CL_CHECK(clSetKernelArg(kernel, 6, sizeof(cl_ulong), &n_blk));
 
-        size_t global_work_size[] = {(size_t)CEIL_DIV(n_blk, 64)*64, 1, 1};
-        size_t local_work_size[] = {64, 1, 1};
+        size_t num_blocks_q6 = (size_t)ggml_nelements(tensor)/ggml_blck_size(tensor->type);
+        size_t lws_q6 = 64;
+        // local work size must not exceed global work size (required by OpenCL spec)
+        while (lws_q6 > num_blocks_q6) { lws_q6 /= 2; }
+        if (lws_q6 == 0) { lws_q6 = 1; }
+        size_t global_work_size[] = {num_blocks_q6, 1, 1};
+        size_t local_work_size[] = {lws_q6, 1, 1};
 
         cl_event evt;
         CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
         CL_CHECK(clWaitForEvents(1, &evt));
         CL_CHECK(clReleaseMemObject(data_device));
+
 
         extra->size_ql = size_ql;
         extra->size_qh = size_qh;
@@ -11804,7 +11806,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             kernel = backend_ctx->kernel_mul_mv_q4_K_f32;
 
             if (backend_ctx->device_name.find("NVIDIA") != std::string::npos) {
-                nth0 = 1;
+                nth0 = 32; // one warp per workgroup; real sub_group_reduce_add via cl_khr_subgroups
                 nth1 = 1;
                 ndst = 4;
             } else if (backend_ctx->gpu_family == INTEL) {
@@ -11846,8 +11848,8 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 #ifdef GGML_OPENCL_SOA_Q
             if (backend_ctx->device_name.find("NVIDIA") != std::string::npos) {
                 kernel = backend_ctx->kernel_mul_mv_q6_K_f32_flat;
-                nth0 = 1;
-                nth1 = 1;
+                nth0 = 32; // one warp (32 lanes); __local tree-reduction inside kernel
+                nth1 = 1;  // N_SIMDGROUP=1 for NVIDIA (overridden in kernel source)
                 ndst = 4;
 
                 CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0_q6_K->ql));

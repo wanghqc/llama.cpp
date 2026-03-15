@@ -602,8 +602,19 @@ kernel void kernel_restore_block_q4_K_noshuffle(
 // This kernel does not deshuffle the bits.
 // Each thread processes a super block.
 //------------------------------------------------------------------------------
+// Block layout (all fields at fixed byte offsets, total 210 bytes):
+//   ql:     offset 0,   size QK_K/2   (128 bytes)
+//   qh:     offset 128, size QK_K/4   (64 bytes)
+//   scales: offset 192, size QK_K/16  (16 bytes)
+//   d:      offset 208, size 2 bytes  (half)
+#define BLOCK_Q6_K_SIZE      210
+#define BLOCK_Q6_K_QL_OFF    0
+#define BLOCK_Q6_K_QH_OFF    128
+#define BLOCK_Q6_K_S_OFF     192
+#define BLOCK_Q6_K_D_OFF     208
+
 kernel void kernel_convert_block_q6_K(
-    global struct block_q6_K * src0,
+    global uchar * src0,
     global uchar * dst_ql,
     global uchar * dst_qh,
     global char  * dst_s,
@@ -611,25 +622,23 @@ kernel void kernel_convert_block_q6_K(
     uchar          mask_lsb_8,
     ulong          n_blk
 ) {
-    if (get_global_id(0) >= n_blk) {
-        return;
-    }
-    global struct block_q6_K * b = (global struct block_q6_K *) src0 + get_global_id(0);
-    global uchar * ql = (global uchar *) dst_ql + QK_K/2*get_global_id(0);
-    global uchar * qh = (global uchar *) dst_qh + QK_K/4*get_global_id(0);
-    global char  * s  = (global char  *) dst_s  + QK_K/16*get_global_id(0);
-    global half  * d  = (global half  *) dst_d  + get_global_id(0);
+    int gid = get_global_id(0);
+    global uchar * blk = src0 + (size_t)gid * BLOCK_Q6_K_SIZE;
+    global uchar * ql = dst_ql + (size_t)gid * (QK_K/2);
+    global uchar * qh = dst_qh + (size_t)gid * (QK_K/4);
+    global char  * s  = (global char  *)(dst_s) + (size_t)gid * (QK_K/16);
+    global half  * d  = dst_d + gid;
 
-    *d = b->d;
+    vstore_half(vload_half(0, (global half *)(blk + BLOCK_Q6_K_D_OFF)), 0, d);
 
     for (int i = 0; i < QK_K/2; ++i) {
-        ql[i] = b->ql[i];
+        ql[i] = blk[BLOCK_Q6_K_QL_OFF + i];
     }
     for (int i = 0; i < QK_K/4; ++i) {
-        qh[i] = b->qh[i];
+        qh[i] = blk[BLOCK_Q6_K_QH_OFF + i];
     }
     for (int i = 0; i < QK_K/16; ++i) {
-        s[i] = b->scales[i];
+        s[i] = (char)blk[BLOCK_Q6_K_S_OFF + i];
     }
 }
 
