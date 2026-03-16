@@ -200,17 +200,32 @@ kernel void kernel_mul_mv_q4_K_f32_flat(
 #endif // !NVIDIA_GPU
 
 // NVIDIA-only SOA flat kernel for Q4_K x f32 matrix-vector multiply.
-// Uses separate qs / scales / d / dmin arrays (AOS -> SOA) for better
-// memory coalescing vs the generic AOS kernel.
 //
-// Thread mapping (32 lanes = 1 warp):
-//   ix  = lid/8   super-block group index (0..3)
-//   it  = lid%8   thread within group
-//   iq  = it/4    first (0) or second (1) half of super-block
-//   ir  = it%4    element group within half (0..3)
-//   BLOCK_STRIDE = N_SIMDWIDTH/8 = 4  (super-blocks per outer loop step)
+// Q4_K qs byte layout (critical):
+//   qs is partitioned into 4 sections of 32 bytes each:
+//     qs[ 0..31]: lo nibble = element   0..31  (sg=0),  hi nibble = element  32..63  (sg=1)
+//     qs[32..63]: lo nibble = element  64..95  (sg=2),  hi nibble = element  96..127 (sg=3)
+//     qs[64..95]: lo nibble = element 128..159 (sg=4),  hi nibble = element 160..191 (sg=5)
+//     qs[96..127]:lo nibble = element 192..223 (sg=6),  hi nibble = element 224..255 (sg=7)
+//   i.e. qs[k] lo nibble = element k (mod 32) + 64*(k/32),
+//            hi nibble = the same element + 32.
 //
-// Each warp computes N_DST=4 output rows and reduces with __local tree.
+// Thread mapping (32 lanes = 1 warp, BLOCK_STRIDE=2):
+//   tid = lid/2   (0..15)  thread role within a super-block
+//   ix  = lid%2   (0..1)   which of the 2 super-blocks this thread handles
+//   ip  = tid/8   (0..1)   first or second 64-element half of the qs section
+//   il  = tid%8   (0..7)   8-byte segment within the half
+//   sg_lo = 4*ip + 2*(il/4)   scale-group for lo nibbles (0,2,4,6)
+//   sg_hi = sg_lo + 1          scale-group for hi nibbles (1,3,5,7)
+//
+// Each thread handles 8 qs bytes:
+//   lo nibbles -> 8 elements from sg_lo, paired with y[y_lo_off..y_lo_off+7]
+//   hi nibbles -> 8 elements from sg_hi, paired with y[y_hi_off..y_hi_off+7]
+//   where y_lo_off = 32*sg_lo + 8*(il%4)
+//         y_hi_off = y_lo_off + 32
+//         q_off    = 64*ip + 8*il  (byte offset into qs[0..127])
+//
+// Scale decode follows get_scale_min_k4 from ggml-quants.c.
 
 #ifdef NVIDIA_GPU
 
@@ -218,13 +233,13 @@ kernel void kernel_mul_mv_q4_K_f32_flat(
 #define K_SCALE_SIZE 12
 #define N_DST        4
 #define N_SIMDWIDTH  32
-#define BLOCK_STRIDE (N_SIMDWIDTH/8)   // = 4
+#define BLOCK_STRIDE (N_SIMDWIDTH/16)   // = 2
 
 kernel void kernel_mul_mv_q4_K_f32_flat(
-    global uchar * src0_qs,      // SOA: quantized weights  [n_blocks * 128 bytes]
-    global uchar * src0_scales,  // SOA: scales             [n_blocks * 12 bytes]
-    global half  * src0_d,       // SOA: super-block scale  [n_blocks halves]
-    global half  * src0_dmin,    // SOA: super-block min    [n_blocks halves]
+    global uchar * src0_qs,
+    global uchar * src0_scales,
+    global half  * src0_d,
+    global half  * src0_dmin,
     global char  * src1,
     int            offset1,
     global char  * dst,
@@ -244,203 +259,155 @@ kernel void kernel_mul_mv_q4_K_f32_flat(
     src1 = src1 + offset1;
     dst  = dst  + offsetd;
 
-    const ushort kmask1 = 0x3f3f;
-    const ushort kmask2 = 0x0f0f;
-    const ushort kmask3 = 0xc0c0;
-
     int nb = ne00 / QK_K;
 
     int r0 = get_group_id(0);
     int r1 = get_group_id(1);
     int im = get_group_id(2);
 
-    int first_row = r0 * N_DST;   // N_SIMDGROUP=1 for NVIDIA
-
+    int first_row = r0 * N_DST;
     int i12 = im % ne12;
     int i13 = im / ne12;
 
     ulong offset_src1 = (ulong)r1*nb11 + (ulong)i12*nb12 + (ulong)i13*nb13;
     global float * y = (global float *)(src1 + offset_src1);
 
-    // Linear block index of the first block of first_row in this batch slice.
     ulong offset_src0 = (ulong)first_row * nb
                       + (ulong)(i12/r2) * ((ulong)nb * ne01)
                       + (ulong)(i13/r3) * ((ulong)nb * ne01 * ne02);
 
     int lid = get_local_id(0);
-    int ix  = lid / 8;    // super-block group (0..3)
-    int it  = lid % 8;    // thread within group
-    int iq  = it / 4;     // half of super-block (0 or 1)
-    int ir  = it % 4;     // element group within half (0..3)
+    int tid = lid / BLOCK_STRIDE;  // 0..15
+    int ix  = lid % BLOCK_STRIDE;  // 0..1
+    int ip  = tid / 8;             // 0 or 1 (which 64-byte qs half)
+    int il  = tid % 8;             // 0..7  (8-byte segment within half)
 
-    global float * y4 = y + (ulong)ix * QK_K + 64 * iq + 8 * ir;
+    // Scale groups: lo nibbles of this thread's qs bytes belong to sg_lo,
+    //               hi nibbles belong to sg_hi = sg_lo+1.
+    int sg_lo = 4*ip + 2*(il/4);  // in {0,2,4,6}
+    int sg_hi = sg_lo + 1;        // in {1,3,5,7}
 
-    float sumf[N_DST] = {0.f, 0.f, 0.f, 0.f};
-    float yl[16], yh[16];
+    // Byte offset into qs[0..127] for this thread's 8 bytes.
+    int q_off = 64*ip + 8*il;
 
-    ushort sc16[4];
-    uchar * sc8 = (uchar *)sc16;
+    // Y element offsets: lo nibbles pair with y[y_lo_off..y_lo_off+7],
+    //                    hi nibbles pair with y[y_hi_off..y_hi_off+7].
+    int y_lo_off = 32*sg_lo + 8*(il & 3);
+    int y_hi_off = y_lo_off + 32;
+
+    float4 sumf = (float4)(0.f);
 
     for (int ib = ix; ib < nb; ib += BLOCK_STRIDE) {
-        // Load y values once; reuse for all 4 output rows.
-        float4 sumy = (float4)(0.f);
-        for (int i = 0; i < 8; ++i) {
-            yl[i+0] = y4[i+0];   sumy.s0 += yl[i+0];
-            yl[i+8] = y4[i+32];  sumy.s1 += yl[i+8];
-            yh[i+0] = y4[i+128]; sumy.s2 += yh[i+0];
-            yh[i+8] = y4[i+160]; sumy.s3 += yh[i+8];
-        }
+        global float * yb = y + (ulong)ib * QK_K;
 
-        // Row 0
+        // Load y values for lo-nibble and hi-nibble elements separately.
+        float4 ylo0 = vload4(0, yb + y_lo_off);      // y[y_lo_off..y_lo_off+3]
+        float4 ylo1 = vload4(0, yb + y_lo_off + 4);  // y[y_lo_off+4..y_lo_off+7]
+        float4 yhi0 = vload4(0, yb + y_hi_off);      // y[y_hi_off..y_hi_off+3]
+        float4 yhi1 = vload4(0, yb + y_hi_off + 4);  // y[y_hi_off+4..y_hi_off+7]
+
+        float sumy_lo = dot(ylo0 + ylo1, (float4)(1.f));
+        float sumy_hi = dot(yhi0 + yhi1, (float4)(1.f));
+
         if (first_row + 0 < ne01) {
             ulong bi = offset_src0 + (ulong)0*nb + ib;
-            global ushort * q1 = (global ushort *)(src0_qs    + bi*(ulong)128) + 16*iq + 4*ir;
-            global ushort * sc = (global ushort *)(src0_scales + bi*(ulong)K_SCALE_SIZE) + iq;
-            float dall = vload_half(0, src0_d    + bi);
-            float dmin = vload_half(0, src0_dmin + bi);
-            sc16[0] = sc[0] & kmask1;
-            sc16[1] = sc[2] & kmask1;
-            sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
-            sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
-            global ushort * q2 = q1 + 32;
-            float4 acc1 = (float4)(0.f), acc2 = (float4)(0.f);
-            for (int i = 0; i < 8; i += 2) {
-                acc1.s0 += yl[i+0] * (q1[i/2] & 0x000F);
-                acc1.s1 += yl[i+1] * (q1[i/2] & 0x0F00);
-                acc1.s2 += yl[i+8] * (q1[i/2] & 0x00F0);
-                acc1.s3 += yl[i+9] * (q1[i/2] & 0xF000);
-                acc2.s0 += yh[i+0] * (q2[i/2] & 0x000F);
-                acc2.s1 += yh[i+1] * (q2[i/2] & 0x0F00);
-                acc2.s2 += yh[i+8] * (q2[i/2] & 0x00F0);
-                acc2.s3 += yh[i+9] * (q2[i/2] & 0xF000);
-            }
-            sumf[0] += dall * ((acc1.s0 + 1.f/256.f * acc1.s1) * sc8[0] +
-                               (acc1.s2 + 1.f/256.f * acc1.s3) * sc8[1] * 1.f/16.f +
-                               (acc2.s0 + 1.f/256.f * acc2.s1) * sc8[4] +
-                               (acc2.s2 + 1.f/256.f * acc2.s3) * sc8[5] * 1.f/16.f) -
-                       dmin * (sumy.s0*sc8[2] + sumy.s1*sc8[3] +
-                               sumy.s2*sc8[6] + sumy.s3*sc8[7]);
+            uchar4 qa = vload4(0, src0_qs + bi*(ulong)128 + q_off);
+            uchar4 qb = vload4(0, src0_qs + bi*(ulong)128 + q_off + 4);
+            float dotq_lo = dot(ylo0, convert_float4(qa & (uchar4)0x0F))
+                          + dot(ylo1, convert_float4(qb & (uchar4)0x0F));
+            float dotq_hi = dot(yhi0, convert_float4(qa >> 4))
+                          + dot(yhi1, convert_float4(qb >> 4));
+            global uchar * sc = src0_scales + bi*(ulong)K_SCALE_SIZE;
+            float scale_lo = sg_lo < 4 ? (float)(sc[sg_lo]   & 63)
+                                       : (float)((sc[sg_lo+4] & 0x0F) | ((sc[sg_lo-4] >> 6) << 4));
+            float scale_hi = sg_hi < 4 ? (float)(sc[sg_hi]   & 63)
+                                       : (float)((sc[sg_hi+4] & 0x0F) | ((sc[sg_hi-4] >> 6) << 4));
+            float smin_lo  = sg_lo < 4 ? (float)(sc[sg_lo+4] & 63)
+                                       : (float)((sc[sg_lo+4] >>    4) | ((sc[sg_lo  ] >> 6) << 4));
+            float smin_hi  = sg_hi < 4 ? (float)(sc[sg_hi+4] & 63)
+                                       : (float)((sc[sg_hi+4] >>    4) | ((sc[sg_hi  ] >> 6) << 4));
+            sumf.s0 += vload_half(0, src0_d    + bi) * (scale_lo * dotq_lo + scale_hi * dotq_hi)
+                     - vload_half(0, src0_dmin  + bi) * (smin_lo  * sumy_lo + smin_hi  * sumy_hi);
         }
-
-        // Row 1
         if (first_row + 1 < ne01) {
             ulong bi = offset_src0 + (ulong)1*nb + ib;
-            global ushort * q1 = (global ushort *)(src0_qs    + bi*(ulong)128) + 16*iq + 4*ir;
-            global ushort * sc = (global ushort *)(src0_scales + bi*(ulong)K_SCALE_SIZE) + iq;
-            float dall = vload_half(0, src0_d    + bi);
-            float dmin = vload_half(0, src0_dmin + bi);
-            sc16[0] = sc[0] & kmask1;
-            sc16[1] = sc[2] & kmask1;
-            sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
-            sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
-            global ushort * q2 = q1 + 32;
-            float4 acc1 = (float4)(0.f), acc2 = (float4)(0.f);
-            for (int i = 0; i < 8; i += 2) {
-                acc1.s0 += yl[i+0] * (q1[i/2] & 0x000F);
-                acc1.s1 += yl[i+1] * (q1[i/2] & 0x0F00);
-                acc1.s2 += yl[i+8] * (q1[i/2] & 0x00F0);
-                acc1.s3 += yl[i+9] * (q1[i/2] & 0xF000);
-                acc2.s0 += yh[i+0] * (q2[i/2] & 0x000F);
-                acc2.s1 += yh[i+1] * (q2[i/2] & 0x0F00);
-                acc2.s2 += yh[i+8] * (q2[i/2] & 0x00F0);
-                acc2.s3 += yh[i+9] * (q2[i/2] & 0xF000);
-            }
-            sumf[1] += dall * ((acc1.s0 + 1.f/256.f * acc1.s1) * sc8[0] +
-                               (acc1.s2 + 1.f/256.f * acc1.s3) * sc8[1] * 1.f/16.f +
-                               (acc2.s0 + 1.f/256.f * acc2.s1) * sc8[4] +
-                               (acc2.s2 + 1.f/256.f * acc2.s3) * sc8[5] * 1.f/16.f) -
-                       dmin * (sumy.s0*sc8[2] + sumy.s1*sc8[3] +
-                               sumy.s2*sc8[6] + sumy.s3*sc8[7]);
+            uchar4 qa = vload4(0, src0_qs + bi*(ulong)128 + q_off);
+            uchar4 qb = vload4(0, src0_qs + bi*(ulong)128 + q_off + 4);
+            float dotq_lo = dot(ylo0, convert_float4(qa & (uchar4)0x0F))
+                          + dot(ylo1, convert_float4(qb & (uchar4)0x0F));
+            float dotq_hi = dot(yhi0, convert_float4(qa >> 4))
+                          + dot(yhi1, convert_float4(qb >> 4));
+            global uchar * sc = src0_scales + bi*(ulong)K_SCALE_SIZE;
+            float scale_lo = sg_lo < 4 ? (float)(sc[sg_lo]   & 63)
+                                       : (float)((sc[sg_lo+4] & 0x0F) | ((sc[sg_lo-4] >> 6) << 4));
+            float scale_hi = sg_hi < 4 ? (float)(sc[sg_hi]   & 63)
+                                       : (float)((sc[sg_hi+4] & 0x0F) | ((sc[sg_hi-4] >> 6) << 4));
+            float smin_lo  = sg_lo < 4 ? (float)(sc[sg_lo+4] & 63)
+                                       : (float)((sc[sg_lo+4] >>    4) | ((sc[sg_lo  ] >> 6) << 4));
+            float smin_hi  = sg_hi < 4 ? (float)(sc[sg_hi+4] & 63)
+                                       : (float)((sc[sg_hi+4] >>    4) | ((sc[sg_hi  ] >> 6) << 4));
+            sumf.s1 += vload_half(0, src0_d    + bi) * (scale_lo * dotq_lo + scale_hi * dotq_hi)
+                     - vload_half(0, src0_dmin  + bi) * (smin_lo  * sumy_lo + smin_hi  * sumy_hi);
         }
-
-        // Row 2
         if (first_row + 2 < ne01) {
             ulong bi = offset_src0 + (ulong)2*nb + ib;
-            global ushort * q1 = (global ushort *)(src0_qs    + bi*(ulong)128) + 16*iq + 4*ir;
-            global ushort * sc = (global ushort *)(src0_scales + bi*(ulong)K_SCALE_SIZE) + iq;
-            float dall = vload_half(0, src0_d    + bi);
-            float dmin = vload_half(0, src0_dmin + bi);
-            sc16[0] = sc[0] & kmask1;
-            sc16[1] = sc[2] & kmask1;
-            sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
-            sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
-            global ushort * q2 = q1 + 32;
-            float4 acc1 = (float4)(0.f), acc2 = (float4)(0.f);
-            for (int i = 0; i < 8; i += 2) {
-                acc1.s0 += yl[i+0] * (q1[i/2] & 0x000F);
-                acc1.s1 += yl[i+1] * (q1[i/2] & 0x0F00);
-                acc1.s2 += yl[i+8] * (q1[i/2] & 0x00F0);
-                acc1.s3 += yl[i+9] * (q1[i/2] & 0xF000);
-                acc2.s0 += yh[i+0] * (q2[i/2] & 0x000F);
-                acc2.s1 += yh[i+1] * (q2[i/2] & 0x0F00);
-                acc2.s2 += yh[i+8] * (q2[i/2] & 0x00F0);
-                acc2.s3 += yh[i+9] * (q2[i/2] & 0xF000);
-            }
-            sumf[2] += dall * ((acc1.s0 + 1.f/256.f * acc1.s1) * sc8[0] +
-                               (acc1.s2 + 1.f/256.f * acc1.s3) * sc8[1] * 1.f/16.f +
-                               (acc2.s0 + 1.f/256.f * acc2.s1) * sc8[4] +
-                               (acc2.s2 + 1.f/256.f * acc2.s3) * sc8[5] * 1.f/16.f) -
-                       dmin * (sumy.s0*sc8[2] + sumy.s1*sc8[3] +
-                               sumy.s2*sc8[6] + sumy.s3*sc8[7]);
+            uchar4 qa = vload4(0, src0_qs + bi*(ulong)128 + q_off);
+            uchar4 qb = vload4(0, src0_qs + bi*(ulong)128 + q_off + 4);
+            float dotq_lo = dot(ylo0, convert_float4(qa & (uchar4)0x0F))
+                          + dot(ylo1, convert_float4(qb & (uchar4)0x0F));
+            float dotq_hi = dot(yhi0, convert_float4(qa >> 4))
+                          + dot(yhi1, convert_float4(qb >> 4));
+            global uchar * sc = src0_scales + bi*(ulong)K_SCALE_SIZE;
+            float scale_lo = sg_lo < 4 ? (float)(sc[sg_lo]   & 63)
+                                       : (float)((sc[sg_lo+4] & 0x0F) | ((sc[sg_lo-4] >> 6) << 4));
+            float scale_hi = sg_hi < 4 ? (float)(sc[sg_hi]   & 63)
+                                       : (float)((sc[sg_hi+4] & 0x0F) | ((sc[sg_hi-4] >> 6) << 4));
+            float smin_lo  = sg_lo < 4 ? (float)(sc[sg_lo+4] & 63)
+                                       : (float)((sc[sg_lo+4] >>    4) | ((sc[sg_lo  ] >> 6) << 4));
+            float smin_hi  = sg_hi < 4 ? (float)(sc[sg_hi+4] & 63)
+                                       : (float)((sc[sg_hi+4] >>    4) | ((sc[sg_hi  ] >> 6) << 4));
+            sumf.s2 += vload_half(0, src0_d    + bi) * (scale_lo * dotq_lo + scale_hi * dotq_hi)
+                     - vload_half(0, src0_dmin  + bi) * (smin_lo  * sumy_lo + smin_hi  * sumy_hi);
         }
-
-        // Row 3
         if (first_row + 3 < ne01) {
             ulong bi = offset_src0 + (ulong)3*nb + ib;
-            global ushort * q1 = (global ushort *)(src0_qs    + bi*(ulong)128) + 16*iq + 4*ir;
-            global ushort * sc = (global ushort *)(src0_scales + bi*(ulong)K_SCALE_SIZE) + iq;
-            float dall = vload_half(0, src0_d    + bi);
-            float dmin = vload_half(0, src0_dmin + bi);
-            sc16[0] = sc[0] & kmask1;
-            sc16[1] = sc[2] & kmask1;
-            sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
-            sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
-            global ushort * q2 = q1 + 32;
-            float4 acc1 = (float4)(0.f), acc2 = (float4)(0.f);
-            for (int i = 0; i < 8; i += 2) {
-                acc1.s0 += yl[i+0] * (q1[i/2] & 0x000F);
-                acc1.s1 += yl[i+1] * (q1[i/2] & 0x0F00);
-                acc1.s2 += yl[i+8] * (q1[i/2] & 0x00F0);
-                acc1.s3 += yl[i+9] * (q1[i/2] & 0xF000);
-                acc2.s0 += yh[i+0] * (q2[i/2] & 0x000F);
-                acc2.s1 += yh[i+1] * (q2[i/2] & 0x0F00);
-                acc2.s2 += yh[i+8] * (q2[i/2] & 0x00F0);
-                acc2.s3 += yh[i+9] * (q2[i/2] & 0xF000);
-            }
-            sumf[3] += dall * ((acc1.s0 + 1.f/256.f * acc1.s1) * sc8[0] +
-                               (acc1.s2 + 1.f/256.f * acc1.s3) * sc8[1] * 1.f/16.f +
-                               (acc2.s0 + 1.f/256.f * acc2.s1) * sc8[4] +
-                               (acc2.s2 + 1.f/256.f * acc2.s3) * sc8[5] * 1.f/16.f) -
-                       dmin * (sumy.s0*sc8[2] + sumy.s1*sc8[3] +
-                               sumy.s2*sc8[6] + sumy.s3*sc8[7]);
+            uchar4 qa = vload4(0, src0_qs + bi*(ulong)128 + q_off);
+            uchar4 qb = vload4(0, src0_qs + bi*(ulong)128 + q_off + 4);
+            float dotq_lo = dot(ylo0, convert_float4(qa & (uchar4)0x0F))
+                          + dot(ylo1, convert_float4(qb & (uchar4)0x0F));
+            float dotq_hi = dot(yhi0, convert_float4(qa >> 4))
+                          + dot(yhi1, convert_float4(qb >> 4));
+            global uchar * sc = src0_scales + bi*(ulong)K_SCALE_SIZE;
+            float scale_lo = sg_lo < 4 ? (float)(sc[sg_lo]   & 63)
+                                       : (float)((sc[sg_lo+4] & 0x0F) | ((sc[sg_lo-4] >> 6) << 4));
+            float scale_hi = sg_hi < 4 ? (float)(sc[sg_hi]   & 63)
+                                       : (float)((sc[sg_hi+4] & 0x0F) | ((sc[sg_hi-4] >> 6) << 4));
+            float smin_lo  = sg_lo < 4 ? (float)(sc[sg_lo+4] & 63)
+                                       : (float)((sc[sg_lo+4] >>    4) | ((sc[sg_lo  ] >> 6) << 4));
+            float smin_hi  = sg_hi < 4 ? (float)(sc[sg_hi+4] & 63)
+                                       : (float)((sc[sg_hi+4] >>    4) | ((sc[sg_hi  ] >> 6) << 4));
+            sumf.s3 += vload_half(0, src0_d    + bi) * (scale_lo * dotq_lo + scale_hi * dotq_hi)
+                     - vload_half(0, src0_dmin  + bi) * (smin_lo  * sumy_lo + smin_hi  * sumy_hi);
         }
-
-        y4 += BLOCK_STRIDE * QK_K;
     }
 
-    // __local tree reduction — N_SIMDWIDTH=32 (warp), N_SIMDGROUP=1.
-    __local float lm[N_DST * N_SIMDWIDTH];
-    lm[0*N_SIMDWIDTH + lid] = sumf[0];
-    lm[1*N_SIMDWIDTH + lid] = sumf[1];
-    lm[2*N_SIMDWIDTH + lid] = sumf[2];
-    lm[3*N_SIMDWIDTH + lid] = sumf[3];
+    // __local float4 tree reduction (one float4 add covers all 4 output rows).
+    __local float4 lm[N_SIMDWIDTH];
+    lm[lid] = sumf;
     barrier(CLK_LOCAL_MEM_FENCE);
     for (int s = N_SIMDWIDTH/2; s > 0; s >>= 1) {
         if (lid < s) {
-            lm[0*N_SIMDWIDTH + lid] += lm[0*N_SIMDWIDTH + lid + s];
-            lm[1*N_SIMDWIDTH + lid] += lm[1*N_SIMDWIDTH + lid + s];
-            lm[2*N_SIMDWIDTH + lid] += lm[2*N_SIMDWIDTH + lid + s];
-            lm[3*N_SIMDWIDTH + lid] += lm[3*N_SIMDWIDTH + lid + s];
+            lm[lid] += lm[lid + s];
         }
         barrier(CLK_LOCAL_MEM_FENCE);
     }
 
     global float * dst_f32 = (global float *)dst + (ulong)im*ne0*ne1 + (ulong)r1*ne0;
     if (lid == 0) {
-        if (first_row + 0 < ne01) dst_f32[first_row + 0] = lm[0*N_SIMDWIDTH];
-        if (first_row + 1 < ne01) dst_f32[first_row + 1] = lm[1*N_SIMDWIDTH];
-        if (first_row + 2 < ne01) dst_f32[first_row + 2] = lm[2*N_SIMDWIDTH];
-        if (first_row + 3 < ne01) dst_f32[first_row + 3] = lm[3*N_SIMDWIDTH];
+        if (first_row + 0 < ne01) dst_f32[first_row + 0] = lm[0].s0;
+        if (first_row + 1 < ne01) dst_f32[first_row + 1] = lm[0].s1;
+        if (first_row + 2 < ne01) dst_f32[first_row + 2] = lm[0].s2;
+        if (first_row + 3 < ne01) dst_f32[first_row + 3] = lm[0].s3;
     }
 }
 
