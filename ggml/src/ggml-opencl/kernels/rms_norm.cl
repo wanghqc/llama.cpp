@@ -55,21 +55,31 @@ kernel void kernel_rms_norm(
     float all_sum = 0;
 
 #ifdef NVIDIA_GPU
-    if (get_local_id(0) != 0) {
-        return;
+    // Full-workgroup parallel reduction via __local tree reduction.
+    // sum[] has get_local_size(0) entries (allocated by host as sizeof(float)*nth).
+    const int lid = (int)get_local_id(0);
+    const int lsz = (int)get_local_size(0);
+
+    float partial = 0.0f;
+    for (int i = lid; i < ne00; i += lsz) {
+        float v = x_scalar[i];
+        partial += v * v;
+    }
+    sum[lid] = partial;
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (int s = lsz/2; s > 0; s >>= 1) {
+        if (lid < s) {
+            sum[lid] += sum[lid + s];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
     }
 
-    float sum_nv = 0.0f;
-    for (int i00 = 0; i00 < ne00; ++i00) {
-        sum_nv += x_scalar[i00] * x_scalar[i00];
-    }
+    const float scale_nv = rsqrt(sum[0] / (float)ne00 + eps);
 
-    const float mean_nv  = sum_nv / ne00;
-    const float scale_nv = 1.0f/sqrt(mean_nv + eps);
-
-    global float * y_scalar_nv = dst + i03*ne02*ne01*ne00 + i02*ne01*ne00 + i01*ne00;
-    for (int i00 = 0; i00 < ne00; ++i00) {
-        y_scalar_nv[i00] = x_scalar[i00] * scale_nv;
+    global float * y_nv = dst + i03*ne02*ne01*ne00 + i02*ne01*ne00 + i01*ne00;
+    for (int i = lid; i < ne00; i += lsz) {
+        y_nv[i] = x_scalar[i] * scale_nv;
     }
     return;
 #endif
@@ -173,24 +183,36 @@ kernel void kernel_rms_norm_mul(
     float sumf = 0;
 
 #ifdef NVIDIA_GPU
-    if (get_local_id(0) != 0) {
-        return;
+    // Full-workgroup parallel reduction via __local tree reduction.
+    // sum[] has get_local_size(0) entries (allocated by host as sizeof(float)*nth).
+    const int lid = (int)get_local_id(0);
+    const int lsz = (int)get_local_size(0);
+
+    // Use scalar pointers to avoid float4 alignment requirements when nb01 is
+    // not a multiple of 16 bytes (e.g. views with non-contiguous rows).
+    global float * x_nv = (global float *) x;
+    global float * y_nv = (global float *)(dst + i03*nb3 + i02*nb2 + i01*nb1);
+    global float * f_nv = (global float *) f;
+
+    float partial = 0.0f;
+    for (int i = lid; i < ne00; i += lsz) {
+        float v = x_nv[i];
+        partial += v * v;
+    }
+    sum[lid] = partial;
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (int s = lsz/2; s > 0; s >>= 1) {
+        if (lid < s) {
+            sum[lid] += sum[lid + s];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
     }
 
-    global float * x_scalar_nv = (global float *) x;
-    global float * f_scalar_nv = (global float *) f;
-    global float * y_scalar_nv = (global float *) (dst + i03*nb3 + i02*nb2 + i01*nb1);
+    const float scale_nv = rsqrt(sum[0] / (float)ne00 + eps);
 
-    float sum_nv = 0.0f;
-    for (int i00 = 0; i00 < ne00; ++i00) {
-        sum_nv += x_scalar_nv[i00] * x_scalar_nv[i00];
-    }
-
-    float mean_nv  = sum_nv / ne00;
-    float scale_nv = 1.0f/sqrt(mean_nv + eps);
-
-    for (int i00 = 0; i00 < ne00; ++i00) {
-        y_scalar_nv[i00] = (x_scalar_nv[i00] * scale_nv) * f_scalar_nv[i00 % ne10];
+    for (int i = lid; i < ne00; i += lsz) {
+        y_nv[i] = (x_nv[i] * scale_nv) * f_nv[i % ne10];
     }
     return;
 #endif

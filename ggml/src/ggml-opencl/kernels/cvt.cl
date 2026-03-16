@@ -642,6 +642,73 @@ kernel void kernel_convert_block_q6_K(
     }
 }
 
+//------------------------------------------------------------------------------
+// kernel_convert_block_q4_K
+// Convert block_q4_K AOS -> SOA (separate d, dmin, scales, qs arrays).
+// Each thread processes one super block.
+// Block layout (total 144 bytes):
+//   d:      offset 0,  size 2 bytes (half)
+//   dmin:   offset 2,  size 2 bytes (half)
+//   scales: offset 4,  size 12 bytes (K_SCALE_SIZE)
+//   qs:     offset 16, size 128 bytes (QK_K/2)
+//------------------------------------------------------------------------------
+#define BLOCK_Q4_K_SIZE     144
+#define BLOCK_Q4_K_D_OFF    0
+#define BLOCK_Q4_K_DMIN_OFF 2
+#define BLOCK_Q4_K_S_OFF    4
+#define BLOCK_Q4_K_QS_OFF   16
+#define K_SCALE_SIZE_4K     12
+#define QK_K_HALF           128  // QK_K/2
+
+kernel void kernel_convert_block_q4_K(
+    global uchar * src0,
+    global half  * dst_d,
+    global half  * dst_dmin,
+    global uchar * dst_scales,
+    global uchar * dst_qs
+) {
+    int gid = get_global_id(0);
+    global uchar * blk    = src0       + (size_t)gid * BLOCK_Q4_K_SIZE;
+    global half  * d      = dst_d      + gid;
+    global half  * dmin   = dst_dmin   + gid;
+    global uchar * sc     = dst_scales + (size_t)gid * K_SCALE_SIZE_4K;
+    global uchar * qs     = dst_qs     + (size_t)gid * QK_K_HALF;
+
+    vstore_half(vload_half(0, (global half *)(blk + BLOCK_Q4_K_D_OFF)),    0, d);
+    vstore_half(vload_half(0, (global half *)(blk + BLOCK_Q4_K_DMIN_OFF)), 0, dmin);
+    for (int i = 0; i < K_SCALE_SIZE_4K; ++i) {
+        sc[i] = blk[BLOCK_Q4_K_S_OFF + i];
+    }
+    for (int i = 0; i < QK_K_HALF; ++i) {
+        qs[i] = blk[BLOCK_Q4_K_QS_OFF + i];
+    }
+}
+
+//------------------------------------------------------------------------------
+// kernel_restore_block_q4_K
+// Convert block_q4_K SOA -> AOS (reconstruct original struct layout).
+// Each thread processes one super block.
+//------------------------------------------------------------------------------
+kernel void kernel_restore_block_q4_K(
+    global half  * src_d,
+    global half  * src_dmin,
+    global uchar * src_scales,
+    global uchar * src_qs,
+    global uchar * dst
+) {
+    int gid = get_global_id(0);
+    global uchar * blk = dst + (size_t)gid * BLOCK_Q4_K_SIZE;
+
+    vstore_half(vload_half(0, src_d    + gid), 0, (global half *)(blk + BLOCK_Q4_K_D_OFF));
+    vstore_half(vload_half(0, src_dmin + gid), 0, (global half *)(blk + BLOCK_Q4_K_DMIN_OFF));
+    for (int i = 0; i < K_SCALE_SIZE_4K; ++i) {
+        blk[BLOCK_Q4_K_S_OFF + i] = src_scales[(size_t)gid * K_SCALE_SIZE_4K + i];
+    }
+    for (int i = 0; i < QK_K_HALF; ++i) {
+        blk[BLOCK_Q4_K_QS_OFF + i] = src_qs[(size_t)gid * QK_K_HALF + i];
+    }
+}
+
 // Restore block_q6_K from flattened arrays.
 // Each thread processes a super block.
 kernel void kernel_restore_block_q6_K(
