@@ -11,6 +11,7 @@
 #include "ggml-backend.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
+#include "ggml-quants.h"
 #include "ggml.h"
 
 #include <CL/cl.h>
@@ -54,6 +55,7 @@
 bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor);
 struct ggml_backend_opencl_context;
 static cl_command_queue ggml_opencl_create_queue(ggml_backend_opencl_context * backend_ctx);
+static void ggml_cl_set_rows_quantized_host_fallback(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 
 // See https://gmplib.org/~tege/divcnst-pldi94.pdf figure 4.1.
 // Precompute mp (m' in the paper) and L such that division
@@ -3994,15 +3996,14 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             }
         case GGML_OP_SET_ROWS:
             {
-                // TODO: add support
-                // ref: https://github.com/ggml-org/llama.cpp/pull/14274
-#pragma message("TODO: implement BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, IQ4_NL support (https://github.com/ggml-org/llama.cpp/pull/14661)")
                 if (op->src[0]->type != GGML_TYPE_F32) {
                     return false;
                 }
                 switch (op->type) {
                     case GGML_TYPE_F16:
                     case GGML_TYPE_F32:
+                    case GGML_TYPE_Q4_0:
+                    case GGML_TYPE_Q8_0:
                         return (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32);
                     default:
                         return false;
@@ -4267,14 +4268,20 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                     return false;
                 }
 
+                const bool kv_quantized = (k->type == GGML_TYPE_Q4_0 || k->type == GGML_TYPE_Q8_0) &&
+                                          (v->type == GGML_TYPE_Q4_0 || v->type == GGML_TYPE_Q8_0);
+
                 const bool is_f32_f32 = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 &&
                                         v->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
                 const bool is_f16_f16 = q->type == GGML_TYPE_F16 && k->type == GGML_TYPE_F16 &&
                                         v->type == GGML_TYPE_F16 && op->type == GGML_TYPE_F16;
                 const bool is_f32_f16 = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 &&
                                         v->type == GGML_TYPE_F16 && op->type == GGML_TYPE_F32;
+                const bool is_quantized = kv_quantized &&
+                                          ((q->type == GGML_TYPE_F16 && op->type == GGML_TYPE_F16) ||
+                                           (q->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32));
 
-                return is_f32_f32 || is_f16_f16 || is_f32_f16;
+                return is_f32_f32 || is_f16_f16 || is_f32_f16 || is_quantized;
             }
         default:
             return false;
@@ -6759,6 +6766,11 @@ static void ggml_cl_set_rows(ggml_backend_t backend, const ggml_tensor * src0, c
     GGML_ASSERT(dst->extra);
     GGML_ASSERT(src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32);
 
+    if (dst->type == GGML_TYPE_Q4_0 || dst->type == GGML_TYPE_Q8_0) {
+        ggml_cl_set_rows_quantized_host_fallback(backend, src0, src1, dst);
+        return;
+    }
+
     // ne0 = ne00
     // ne2 = ne02
     // ne3 = ne03
@@ -6865,6 +6877,98 @@ static void ggml_cl_set_rows(ggml_backend_t backend, const ggml_tensor * src0, c
     size_t local_work_size[] = {(size_t)nth0, (size_t)rows_per_workgroup, 1};
 
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+}
+
+static void ggml_cl_set_rows_quantized_host_fallback(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
+    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *) dst->extra;
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->type == GGML_TYPE_Q4_0 || dst->type == GGML_TYPE_Q8_0);
+    GGML_ASSERT(ggml_is_contiguous_rows(src0));
+    GGML_ASSERT(ggml_is_contiguous_rows(dst));
+    GGML_ASSERT(extrad);
+    GGML_ASSERT(extrad->data_device);
+    GGML_ASSERT(dst->view_offs % ggml_row_size(dst->type, dst->ne[0]) == 0);
+
+    const int64_t ne0 = dst->ne[0];
+    const int64_t ne1 = dst->ne[1];
+    const int64_t ne2 = dst->ne[2];
+    const int64_t src_rows = src0->ne[1];
+    const int64_t src_ne2 = src0->ne[2];
+    const int64_t src_ne3 = src0->ne[3];
+    const int64_t idx_ne1 = src1->ne[1];
+    const int64_t idx_ne2 = src1->ne[2];
+    const size_t row_size = ggml_row_size(dst->type, ne0);
+    const int64_t row_base = dst->view_offs / row_size;
+
+    std::vector<uint8_t> host_src0(ggml_nbytes(src0));
+    std::vector<uint8_t> host_src1(ggml_nbytes(src1));
+    ggml_backend_tensor_get(src0, host_src0.data(), 0, host_src0.size());
+    ggml_backend_tensor_get(src1, host_src1.data(), 0, host_src1.size());
+
+    auto get_index = [&](int64_t i01, int64_t i02, int64_t i03) -> int64_t {
+        const int64_t i11 = idx_ne1 > 0 ? (i02 % idx_ne1) : 0;
+        const int64_t i12 = idx_ne2 > 0 ? (i03 % idx_ne2) : 0;
+        const size_t off = (size_t) i01 * src1->nb[0] + (size_t) i11 * src1->nb[1] + (size_t) i12 * src1->nb[2];
+        if (src1->type == GGML_TYPE_I64) {
+            return *(const int64_t *) (host_src1.data() + off);
+        }
+        return *(const int32_t *) (host_src1.data() + off);
+    };
+
+    static bool warned = false;
+    if (!warned) {
+        GGML_LOG_WARN("%s: OpenCL SET_ROWS for quantized tensors uses a temporary CPU quantization fallback on GPU-resident KV cache; performance may be poor\n", __func__);
+        warned = true;
+    }
+
+    sync_with_other_backends(backend_ctx);
+
+    if (dst->type == GGML_TYPE_Q4_0) {
+        std::vector<block_q4_0> packed_row(ne0 / QK4_0);
+
+        for (int64_t i03 = 0; i03 < src_ne3; ++i03) {
+            for (int64_t i02 = 0; i02 < src_ne2; ++i02) {
+                for (int64_t i01 = 0; i01 < src_rows; ++i01) {
+                    const int64_t dst_i1 = get_index(i01, i02, i03);
+                    GGML_ASSERT(dst_i1 >= 0 && dst_i1 < ne1);
+
+                    const size_t src_off = (size_t) i01 * src0->nb[1] + (size_t) i02 * src0->nb[2] + (size_t) i03 * src0->nb[3];
+                    const float * src_row = (const float *) (host_src0.data() + src_off);
+                    quantize_row_q4_0_ref(src_row, packed_row.data(), ne0);
+
+                    const size_t row_index = (size_t) (row_base + dst_i1 + ne1 * (i02 + ne2 * i03));
+                    const size_t dst_off = extrad->offset + row_index * row_size;
+                    GGML_ASSERT(dst_off + row_size <= extrad->offset + extrad->actual_size);
+                    CL_CHECK(clEnqueueWriteBuffer(backend_ctx->queue, extrad->data_device, CL_FALSE, dst_off, row_size, packed_row.data(), 0, NULL, NULL));
+                }
+            }
+        }
+    } else {
+        std::vector<block_q8_0> packed_row(ne0 / QK8_0);
+
+        for (int64_t i03 = 0; i03 < src_ne3; ++i03) {
+            for (int64_t i02 = 0; i02 < src_ne2; ++i02) {
+                for (int64_t i01 = 0; i01 < src_rows; ++i01) {
+                    const int64_t dst_i1 = get_index(i01, i02, i03);
+                    GGML_ASSERT(dst_i1 >= 0 && dst_i1 < ne1);
+
+                    const size_t src_off = (size_t) i01 * src0->nb[1] + (size_t) i02 * src0->nb[2] + (size_t) i03 * src0->nb[3];
+                    const float * src_row = (const float *) (host_src0.data() + src_off);
+                    quantize_row_q8_0_ref(src_row, packed_row.data(), ne0);
+
+                    const size_t row_index = (size_t) (row_base + dst_i1 + ne1 * (i02 + ne2 * i03));
+                    const size_t dst_off = extrad->offset + row_index * row_size;
+                    GGML_ASSERT(dst_off + row_size <= extrad->offset + extrad->actual_size);
+                    CL_CHECK(clEnqueueWriteBuffer(backend_ctx->queue, extrad->data_device, CL_FALSE, dst_off, row_size, packed_row.data(), 0, NULL, NULL));
+                }
+            }
+        }
+    }
+
+    CL_CHECK(clFinish(backend_ctx->queue));
 }
 
 static void ggml_cl_add(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -9412,6 +9516,84 @@ static void ggml_cl_timestep_embedding(ggml_backend_t backend, const ggml_tensor
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, NULL, dst);
 }
 
+struct ggml_cl_flash_attn_temp_buffer {
+    cl_mem data = nullptr;
+
+    ~ggml_cl_flash_attn_temp_buffer() {
+        if (data != nullptr) {
+            CL_CHECK(clReleaseMemObject(data));
+            data = nullptr;
+        }
+    }
+};
+
+static bool ggml_cl_flash_attn_prepare_quantized_tensor(
+        ggml_backend_opencl_context *         backend_ctx,
+        const ggml_tensor *                   tensor,
+        ggml_type                             target_type,
+        ggml_cl_flash_attn_temp_buffer &      temp,
+        cl_mem &                              data_device,
+        cl_ulong &                            offset,
+        cl_ulong &                            nb1,
+        cl_ulong &                            nb2,
+        cl_ulong &                            nb3) {
+    if (!ggml_is_quantized(tensor->type)) {
+        return false;
+    }
+
+    ggml_tensor_extra_cl * extra = (ggml_tensor_extra_cl *) tensor->extra;
+    GGML_ASSERT(extra);
+    GGML_ASSERT(extra->data_device);
+
+    const int64_t n = ggml_nelements(tensor);
+    std::vector<uint8_t> host_quant(ggml_nbytes(tensor));
+
+    sync_with_other_backends(backend_ctx);
+    CL_CHECK(clEnqueueReadBuffer(
+        backend_ctx->queue,
+        extra->data_device,
+        CL_TRUE,
+        extra->offset + tensor->view_offs,
+        host_quant.size(),
+        host_quant.data(),
+        0,
+        NULL,
+        NULL));
+
+    std::vector<float> host_f32(n);
+    ggml_get_type_traits(tensor->type)->to_float(host_quant.data(), host_f32.data(), n);
+
+    const size_t bytes_per_elem = ggml_type_size(target_type);
+    const size_t buffer_size = (size_t) n * bytes_per_elem;
+
+    std::vector<uint8_t> host_linear(buffer_size);
+    if (target_type == GGML_TYPE_F32) {
+        memcpy(host_linear.data(), host_f32.data(), buffer_size);
+    } else {
+        GGML_ASSERT(target_type == GGML_TYPE_F16);
+        ggml_fp32_to_fp16_row(host_f32.data(), (ggml_fp16_t *) host_linear.data(), n);
+    }
+
+    cl_int err;
+    temp.data = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, buffer_size, NULL, &err);
+    CL_CHECK(err);
+    CL_CHECK(clEnqueueWriteBuffer(backend_ctx->queue, temp.data, CL_TRUE, 0, buffer_size, host_linear.data(), 0, NULL, NULL));
+
+    data_device = temp.data;
+    offset = 0;
+    nb1 = (cl_ulong) (tensor->ne[0] * bytes_per_elem);
+    nb2 = (cl_ulong) (tensor->ne[1] * nb1);
+    nb3 = (cl_ulong) (tensor->ne[2] * nb2);
+
+    static bool warned = false;
+    if (!warned) {
+        GGML_LOG_WARN("%s: OpenCL flash attention dequantizes GPU-resident quantized KV cache into temporary linear buffers; performance may be poor\n", __func__);
+        warned = true;
+    }
+
+    return true;
+}
+
 static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, const ggml_tensor * k, ggml_tensor * dst) {
     const ggml_tensor * v = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
@@ -9479,8 +9661,8 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     cl_ulong offset_sinks = extra_sinks ? extra_sinks->offset + sinks->view_offs : 0;
 
     const cl_ulong q_nb1 = q->nb[1], q_nb2 = q->nb[2], q_nb3 = q->nb[3];
-    const cl_ulong k_nb1 = k->nb[1], k_nb2 = k->nb[2], k_nb3 = k->nb[3];
-    const cl_ulong v_nb1 = v->nb[1], v_nb2 = v->nb[2], v_nb3 = v->nb[3];
+    cl_ulong k_nb1 = k->nb[1], k_nb2 = k->nb[2], k_nb3 = k->nb[3];
+    cl_ulong v_nb1 = v->nb[1], v_nb2 = v->nb[2], v_nb3 = v->nb[3];
     const cl_ulong o_nb1 = dst->nb[1], o_nb2 = dst->nb[2], o_nb3 = dst->nb[3];
     const cl_ulong mask_nb1 = mask ? mask->nb[1] : 0;
     const cl_ulong mask_nb2 = mask ? mask->nb[2] : 0;
@@ -9494,6 +9676,15 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     max_bias      = params[1];
     logit_softcap = params[2];
 
+    ggml_cl_flash_attn_temp_buffer temp_k;
+    ggml_cl_flash_attn_temp_buffer temp_v;
+    const ggml_type kv_target_type = is_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32;
+
+    cl_mem k_data_device = extra_k->data_device;
+    cl_mem v_data_device = extra_v->data_device;
+    ggml_cl_flash_attn_prepare_quantized_tensor(backend_ctx, k, kv_target_type, temp_k, k_data_device, offset_k, k_nb1, k_nb2, k_nb3);
+    ggml_cl_flash_attn_prepare_quantized_tensor(backend_ctx, v, kv_target_type, temp_v, v_data_device, offset_v, v_nb1, v_nb2, v_nb3);
+
     const int is_causal = (mask == NULL && n_q > 1 && n_q == n_kv);
 
     const int n_head_log2_val = n_head > 0 ? 1u << (int)floorf(log2f((float)n_head)) : 0;
@@ -9503,9 +9694,9 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
 
     CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &extra_q->data_device));
     CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_ulong), &offset_q));
-    CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &extra_k->data_device));
+    CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &k_data_device));
     CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_ulong), &offset_k));
-    CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_mem),   &extra_v->data_device));
+    CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_mem),   &v_data_device));
     CL_CHECK(clSetKernelArg(kernel, 5, sizeof(cl_ulong), &offset_v));
     CL_CHECK(clSetKernelArg(kernel, 6, sizeof(cl_mem),   &extra_o->data_device));
     CL_CHECK(clSetKernelArg(kernel, 7, sizeof(cl_ulong), &offset_o));
