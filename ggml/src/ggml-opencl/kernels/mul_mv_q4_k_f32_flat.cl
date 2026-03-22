@@ -199,41 +199,39 @@ kernel void kernel_mul_mv_q4_K_f32_flat(
 
 #endif // !NVIDIA_GPU
 
-// NVIDIA-only SOA flat kernel for Q4_K x f32 matrix-vector multiply.
+// NVIDIA OpenCL does not expose cl_khr_subgroups as a compile-time extension
+// macro, so we skip the #pragma here and use __local tree-reduction instead.
+
+// SOA flat kernel for Q4_K x f32 matrix-vector multiply.
+// NVIDIA only: N_SIMDWIDTH=32 (warp), BLOCK_STRIDE=2, __local tree-reduction.
 //
-// Q4_K qs byte layout (critical):
-//   qs is partitioned into 4 sections of 32 bytes each:
-//     qs[ 0..31]: lo nibble = element   0..31  (sg=0),  hi nibble = element  32..63  (sg=1)
-//     qs[32..63]: lo nibble = element  64..95  (sg=2),  hi nibble = element  96..127 (sg=3)
-//     qs[64..95]: lo nibble = element 128..159 (sg=4),  hi nibble = element 160..191 (sg=5)
-//     qs[96..127]:lo nibble = element 192..223 (sg=6),  hi nibble = element 224..255 (sg=7)
-//   i.e. qs[k] lo nibble = element k (mod 32) + 64*(k/32),
-//            hi nibble = the same element + 32.
+// Q4_K qs byte layout (SOA, 128 bytes per super-block = QK_K/2):
+//   qs[ 0..31]: lo nibble = element   0..31  (sg=0),  hi nibble = element  32..63  (sg=1)
+//   qs[32..63]: lo nibble = element  64..95  (sg=2),  hi nibble = element  96..127 (sg=3)
+//   qs[64..95]: lo nibble = element 128..159 (sg=4),  hi nibble = element 160..191 (sg=5)
+//   qs[96..127]:lo nibble = element 192..223 (sg=6),  hi nibble = element 224..255 (sg=7)
 //
-// Thread mapping (32 lanes = 1 warp, BLOCK_STRIDE=2):
-//   tid = lid/2   (0..15)  thread role within a super-block
-//   ix  = lid%2   (0..1)   which of the 2 super-blocks this thread handles
-//   ip  = tid/8   (0..1)   first or second 64-element half of the qs section
-//   il  = tid%8   (0..7)   8-byte segment within the half
+// Thread mapping (16 threads per super-block):
+//   tid = lid / BLOCK_STRIDE  (0..15)   role within super-block
+//   ix  = lid % BLOCK_STRIDE  (0..BLOCK_STRIDE-1)  which super-block this thread handles
+//   ip  = tid / 8  (0..1)   first or second 64-byte qs section
+//   il  = tid % 8  (0..7)   8-byte segment within section
 //   sg_lo = 4*ip + 2*(il/4)   scale-group for lo nibbles (0,2,4,6)
 //   sg_hi = sg_lo + 1          scale-group for hi nibbles (1,3,5,7)
-//
-// Each thread handles 8 qs bytes:
-//   lo nibbles -> 8 elements from sg_lo, paired with y[y_lo_off..y_lo_off+7]
-//   hi nibbles -> 8 elements from sg_hi, paired with y[y_hi_off..y_hi_off+7]
-//   where y_lo_off = 32*sg_lo + 8*(il%4)
-//         y_hi_off = y_lo_off + 32
-//         q_off    = 64*ip + 8*il  (byte offset into qs[0..127])
+//   q_off    = 64*ip + 8*il   byte offset into qs[0..127]
+//   y_lo_off = 32*sg_lo + 8*(il&3)
+//   y_hi_off = y_lo_off + 32
 //
 // Scale decode follows get_scale_min_k4 from ggml-quants.c.
-
-#ifdef NVIDIA_GPU
 
 #define QK_K         256
 #define K_SCALE_SIZE 12
 #define N_DST        4
-#define N_SIMDWIDTH  32
-#define BLOCK_STRIDE (N_SIMDWIDTH/16)   // = 2
+
+#define N_SIMDWIDTH 32
+
+// 16 threads collaborate on one super-block, BLOCK_STRIDE super-blocks per iteration
+#define BLOCK_STRIDE (N_SIMDWIDTH/16)
 
 kernel void kernel_mul_mv_q4_K_f32_flat(
     global uchar * src0_qs,
@@ -272,26 +270,31 @@ kernel void kernel_mul_mv_q4_K_f32_flat(
     ulong offset_src1 = (ulong)r1*nb11 + (ulong)i12*nb12 + (ulong)i13*nb13;
     global float * y = (global float *)(src1 + offset_src1);
 
+    // Flat block index base for src0 (in units of super-blocks).
+    // Layout: [ne02][ne01][nb] super-blocks, with GQA broadcasting via r2/r3.
     ulong offset_src0 = (ulong)first_row * nb
                       + (ulong)(i12/r2) * ((ulong)nb * ne01)
                       + (ulong)(i13/r3) * ((ulong)nb * ne01 * ne02);
 
     int lid = get_local_id(0);
-    int tid = lid / BLOCK_STRIDE;  // 0..15
-    int ix  = lid % BLOCK_STRIDE;  // 0..1
-    int ip  = tid / 8;             // 0 or 1 (which 64-byte qs half)
-    int il  = tid % 8;             // 0..7  (8-byte segment within half)
+    int tid = lid / BLOCK_STRIDE;  // 0..15: role within a super-block
+    int ix  = lid % BLOCK_STRIDE;  // 0..BLOCK_STRIDE-1: which super-block per iter
 
-    // Scale groups: lo nibbles of this thread's qs bytes belong to sg_lo,
-    //               hi nibbles belong to sg_hi = sg_lo+1.
+    int ip  = tid / 8;             // 0 or 1 (which 64-byte qs section)
+    int il  = tid % 8;             // 0..7  (8-byte segment within section)
+
+    // Scale groups for lo and hi nibbles of this thread's 8 qs bytes.
     int sg_lo = 4*ip + 2*(il/4);  // in {0,2,4,6}
     int sg_hi = sg_lo + 1;        // in {1,3,5,7}
+    // Clamped versions for safe speculative evaluation in ternary false-branch
+    // (GPU evaluates both branches; negative index -> page fault).
+    int sg_lo_m4 = max(sg_lo - 4, 0);  // safe substitute for sg_lo-4
+    int sg_hi_m4 = max(sg_hi - 4, 0);  // safe substitute for sg_hi-4
 
     // Byte offset into qs[0..127] for this thread's 8 bytes.
     int q_off = 64*ip + 8*il;
 
-    // Y element offsets: lo nibbles pair with y[y_lo_off..y_lo_off+7],
-    //                    hi nibbles pair with y[y_hi_off..y_hi_off+7].
+    // Y element offsets.
     int y_lo_off = 32*sg_lo + 8*(il & 3);
     int y_hi_off = y_lo_off + 32;
 
@@ -300,11 +303,10 @@ kernel void kernel_mul_mv_q4_K_f32_flat(
     for (int ib = ix; ib < nb; ib += BLOCK_STRIDE) {
         global float * yb = y + (ulong)ib * QK_K;
 
-        // Load y values for lo-nibble and hi-nibble elements separately.
         float4 ylo0 = vload4(0, yb + y_lo_off);      // y[y_lo_off..y_lo_off+3]
         float4 ylo1 = vload4(0, yb + y_lo_off + 4);  // y[y_lo_off+4..y_lo_off+7]
-        float4 yhi0 = vload4(0, yb + y_hi_off);      // y[y_hi_off..y_hi_off+3]
-        float4 yhi1 = vload4(0, yb + y_hi_off + 4);  // y[y_hi_off+4..y_hi_off+7]
+        float4 yhi0 = vload4(0, yb + y_hi_off);
+        float4 yhi1 = vload4(0, yb + y_hi_off + 4);
 
         float sumy_lo = dot(ylo0 + ylo1, (float4)(1.f));
         float sumy_hi = dot(yhi0 + yhi1, (float4)(1.f));
@@ -315,13 +317,13 @@ kernel void kernel_mul_mv_q4_K_f32_flat(
             uchar4 qb = vload4(0, src0_qs + bi*(ulong)128 + q_off + 4);
             float dotq_lo = dot(ylo0, convert_float4(qa & (uchar4)0x0F))
                           + dot(ylo1, convert_float4(qb & (uchar4)0x0F));
-            float dotq_hi = dot(yhi0, convert_float4(qa >> 4))
-                          + dot(yhi1, convert_float4(qb >> 4));
+            float dotq_hi = dot(yhi0, convert_float4(qa >> (uchar)4))
+                          + dot(yhi1, convert_float4(qb >> (uchar)4));
             global uchar * sc = src0_scales + bi*(ulong)K_SCALE_SIZE;
             float scale_lo = sg_lo < 4 ? (float)(sc[sg_lo]   & 63)
-                                       : (float)((sc[sg_lo+4] & 0x0F) | ((sc[sg_lo-4] >> 6) << 4));
+                                       : (float)((sc[sg_lo+4] & 0x0F) | ((sc[sg_lo_m4] >> 6) << 4));
             float scale_hi = sg_hi < 4 ? (float)(sc[sg_hi]   & 63)
-                                       : (float)((sc[sg_hi+4] & 0x0F) | ((sc[sg_hi-4] >> 6) << 4));
+                                       : (float)((sc[sg_hi+4] & 0x0F) | ((sc[sg_hi_m4] >> 6) << 4));
             float smin_lo  = sg_lo < 4 ? (float)(sc[sg_lo+4] & 63)
                                        : (float)((sc[sg_lo+4] >>    4) | ((sc[sg_lo  ] >> 6) << 4));
             float smin_hi  = sg_hi < 4 ? (float)(sc[sg_hi+4] & 63)
@@ -335,13 +337,13 @@ kernel void kernel_mul_mv_q4_K_f32_flat(
             uchar4 qb = vload4(0, src0_qs + bi*(ulong)128 + q_off + 4);
             float dotq_lo = dot(ylo0, convert_float4(qa & (uchar4)0x0F))
                           + dot(ylo1, convert_float4(qb & (uchar4)0x0F));
-            float dotq_hi = dot(yhi0, convert_float4(qa >> 4))
-                          + dot(yhi1, convert_float4(qb >> 4));
+            float dotq_hi = dot(yhi0, convert_float4(qa >> (uchar)4))
+                          + dot(yhi1, convert_float4(qb >> (uchar)4));
             global uchar * sc = src0_scales + bi*(ulong)K_SCALE_SIZE;
             float scale_lo = sg_lo < 4 ? (float)(sc[sg_lo]   & 63)
-                                       : (float)((sc[sg_lo+4] & 0x0F) | ((sc[sg_lo-4] >> 6) << 4));
+                                       : (float)((sc[sg_lo+4] & 0x0F) | ((sc[sg_lo_m4] >> 6) << 4));
             float scale_hi = sg_hi < 4 ? (float)(sc[sg_hi]   & 63)
-                                       : (float)((sc[sg_hi+4] & 0x0F) | ((sc[sg_hi-4] >> 6) << 4));
+                                       : (float)((sc[sg_hi+4] & 0x0F) | ((sc[sg_hi_m4] >> 6) << 4));
             float smin_lo  = sg_lo < 4 ? (float)(sc[sg_lo+4] & 63)
                                        : (float)((sc[sg_lo+4] >>    4) | ((sc[sg_lo  ] >> 6) << 4));
             float smin_hi  = sg_hi < 4 ? (float)(sc[sg_hi+4] & 63)
@@ -355,13 +357,13 @@ kernel void kernel_mul_mv_q4_K_f32_flat(
             uchar4 qb = vload4(0, src0_qs + bi*(ulong)128 + q_off + 4);
             float dotq_lo = dot(ylo0, convert_float4(qa & (uchar4)0x0F))
                           + dot(ylo1, convert_float4(qb & (uchar4)0x0F));
-            float dotq_hi = dot(yhi0, convert_float4(qa >> 4))
-                          + dot(yhi1, convert_float4(qb >> 4));
+            float dotq_hi = dot(yhi0, convert_float4(qa >> (uchar)4))
+                          + dot(yhi1, convert_float4(qb >> (uchar)4));
             global uchar * sc = src0_scales + bi*(ulong)K_SCALE_SIZE;
             float scale_lo = sg_lo < 4 ? (float)(sc[sg_lo]   & 63)
-                                       : (float)((sc[sg_lo+4] & 0x0F) | ((sc[sg_lo-4] >> 6) << 4));
+                                       : (float)((sc[sg_lo+4] & 0x0F) | ((sc[sg_lo_m4] >> 6) << 4));
             float scale_hi = sg_hi < 4 ? (float)(sc[sg_hi]   & 63)
-                                       : (float)((sc[sg_hi+4] & 0x0F) | ((sc[sg_hi-4] >> 6) << 4));
+                                       : (float)((sc[sg_hi+4] & 0x0F) | ((sc[sg_hi_m4] >> 6) << 4));
             float smin_lo  = sg_lo < 4 ? (float)(sc[sg_lo+4] & 63)
                                        : (float)((sc[sg_lo+4] >>    4) | ((sc[sg_lo  ] >> 6) << 4));
             float smin_hi  = sg_hi < 4 ? (float)(sc[sg_hi+4] & 63)
@@ -375,13 +377,13 @@ kernel void kernel_mul_mv_q4_K_f32_flat(
             uchar4 qb = vload4(0, src0_qs + bi*(ulong)128 + q_off + 4);
             float dotq_lo = dot(ylo0, convert_float4(qa & (uchar4)0x0F))
                           + dot(ylo1, convert_float4(qb & (uchar4)0x0F));
-            float dotq_hi = dot(yhi0, convert_float4(qa >> 4))
-                          + dot(yhi1, convert_float4(qb >> 4));
+            float dotq_hi = dot(yhi0, convert_float4(qa >> (uchar)4))
+                          + dot(yhi1, convert_float4(qb >> (uchar)4));
             global uchar * sc = src0_scales + bi*(ulong)K_SCALE_SIZE;
             float scale_lo = sg_lo < 4 ? (float)(sc[sg_lo]   & 63)
-                                       : (float)((sc[sg_lo+4] & 0x0F) | ((sc[sg_lo-4] >> 6) << 4));
+                                       : (float)((sc[sg_lo+4] & 0x0F) | ((sc[sg_lo_m4] >> 6) << 4));
             float scale_hi = sg_hi < 4 ? (float)(sc[sg_hi]   & 63)
-                                       : (float)((sc[sg_hi+4] & 0x0F) | ((sc[sg_hi-4] >> 6) << 4));
+                                       : (float)((sc[sg_hi+4] & 0x0F) | ((sc[sg_hi_m4] >> 6) << 4));
             float smin_lo  = sg_lo < 4 ? (float)(sc[sg_lo+4] & 63)
                                        : (float)((sc[sg_lo+4] >>    4) | ((sc[sg_lo  ] >> 6) << 4));
             float smin_hi  = sg_hi < 4 ? (float)(sc[sg_hi+4] & 63)
@@ -391,18 +393,17 @@ kernel void kernel_mul_mv_q4_K_f32_flat(
         }
     }
 
-    // __local float4 tree reduction (one float4 add covers all 4 output rows).
+    global float * dst_f32 = (global float *)dst + (ulong)im*ne0*ne1 + (ulong)r1*ne0;
+
+    // NVIDIA: cl_khr_subgroups is not exposed as a compile-time extension macro,
+    // so use __local tree-reduction instead of sub_group_reduce_add.
     __local float4 lm[N_SIMDWIDTH];
     lm[lid] = sumf;
     barrier(CLK_LOCAL_MEM_FENCE);
     for (int s = N_SIMDWIDTH/2; s > 0; s >>= 1) {
-        if (lid < s) {
-            lm[lid] += lm[lid + s];
-        }
+        if (lid < s) lm[lid] += lm[lid + s];
         barrier(CLK_LOCAL_MEM_FENCE);
     }
-
-    global float * dst_f32 = (global float *)dst + (ulong)im*ne0*ne1 + (ulong)r1*ne0;
     if (lid == 0) {
         if (first_row + 0 < ne01) dst_f32[first_row + 0] = lm[0].s0;
         if (first_row + 1 < ne01) dst_f32[first_row + 1] = lm[0].s1;
@@ -410,5 +411,3 @@ kernel void kernel_mul_mv_q4_K_f32_flat(
         if (first_row + 3 < ne01) dst_f32[first_row + 3] = lm[0].s3;
     }
 }
-
-#endif // NVIDIA_GPU
