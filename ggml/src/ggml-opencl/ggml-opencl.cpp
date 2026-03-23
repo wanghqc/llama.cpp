@@ -419,6 +419,12 @@ struct ggml_backend_opencl_context {
     ggml_cl_buffer prealloc_scales_trans;
     ggml_cl_buffer prealloc_act_trans;
 
+    // prealloc source buffers for Q4_0 weight transpose (pre-transpose input).
+    // Allocated in ggml_cl2_init (before the model pool) so no extra GPU
+    // memory is needed during set_tensor even when the pool is nearly full.
+    ggml_cl_buffer prealloc_quant_src;
+    ggml_cl_buffer prealloc_scales_src;
+
     // prealloc buffers for src0 and src1
     ggml_cl_buffer prealloc_src0;
     ggml_cl_buffer prealloc_src1;
@@ -3428,10 +3434,19 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
                           required_B_d_bytes, max_B_d_bytes);
         }
 
-        backend_ctx->prealloc_quant_trans.allocate(context, max_A_q_d_bytes);
-        backend_ctx->prealloc_scales_trans.allocate(context, max_A_s_d_bytes);
-        backend_ctx->prealloc_act_trans.allocate(context, max_B_d_bytes);
-    }
+    backend_ctx->prealloc_quant_trans.allocate(context, max_A_q_d_bytes);
+    backend_ctx->prealloc_scales_trans.allocate(context, max_A_s_d_bytes);
+    backend_ctx->prealloc_act_trans.allocate(context, max_B_d_bytes);
+
+    // Source (pre-transpose) buffers for Q4_0 weight set_tensor.
+    // These are sized for the largest individual Q4_0 weight matrix expected
+    // in any current LLM (≤ 64 MB for quants, ≤ 8 MB for scales).
+    // Allocated here, before the model pool, so set_tensor never needs a new
+    // GPU allocation when the pool is nearly full.
+    static const size_t Q4_0_QUANT_SRC_SIZE  = 128 * 1024 * 1024;  // 128 MB
+    static const size_t Q4_0_SCALES_SRC_SIZE =  16 * 1024 * 1024;  //  16 MB
+    backend_ctx->prealloc_quant_src.allocate(context, Q4_0_QUANT_SRC_SIZE);
+    backend_ctx->prealloc_scales_src.allocate(context, Q4_0_SCALES_SRC_SIZE);
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
 
     backend_ctx->disable_fusion = getenv("GGML_OPENCL_DISABLE_FUSION") != nullptr;
@@ -4781,124 +4796,131 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         size_t size_q = ggml_nelements(tensor)/ggml_blck_size(tensor->type)*ggml_blck_size(tensor->type)/2;
         GGML_ASSERT(size_d + size_q == ggml_nbytes(tensor) && "Incorrect tensor size");
 
+        // CPU-side AoS→SOA using sub-buffers of the main pool: zero extra GPU memory.
+        // block_q4_0: [d(2B) | qs(16B)] = 18 bytes per block.
+        //
+        // Sub-buffer origins must be 128-byte aligned (CL_DEVICE_MEM_BASE_ADDR_ALIGN=128).
+        // For real LLM weight matrices n_blocks is always a large multiple of 64, so
+        // size_d (= n_blocks*2) is always a multiple of 128 and the second origin is safe.
+        //
+        // The Adreno transpose path creates CL_MEM_OBJECT_IMAGE1D_BUFFER images from the
+        // SOA buffers.  Qualcomm's OpenCL driver does NOT support image creation from
+        // sub-buffers, so for tensors that go through the transpose we use temporary
+        // standalone buffers as image sources and copy the transposed result back into the
+        // sub-buffers.  The standalone buffers are released after the transpose.
+        const uint8_t * src8   = (const uint8_t *)data;
+        const size_t    n_blks = ggml_nelements(tensor) / ggml_blck_size(tensor->type);
+        const size_t    per_d  = size_d / n_blks;   // 2 bytes (ggml_fp16_t)
+        const size_t    per_q  = size_q / n_blks;   // 16 bytes (QK4_0/2)
+        const size_t    stride = per_d + per_q;     // 18 bytes per block
+
         cl_int err;
-        cl_mem data_device = clCreateBuffer(context, CL_MEM_READ_WRITE,
-            ggml_nbytes(tensor), NULL, &err);
-        CL_CHECK(err);
-        CL_CHECK(clEnqueueWriteBuffer(
-            queue, data_device, CL_TRUE, 0,
-            ggml_nbytes(tensor), data, 0, NULL, NULL));
+        cl_buffer_region region;
 
-        // We consider the specified offset arg as always, although For weights
-        // the offset arg should be 0 (we do not assert this).
-        //GGML_ASSERT(offset == 0);
-
-        // We create subbuffers from the original tensor buffer for scales and
-        // quants - i.e., scales and quants are aliases into the buffer object
-        // that backs the original tensor. This is a cleaner way to adapt to the
-        // new memory management.
-        // In the old code, we allocate new buffers for scales and quants
-        // respectively, which could still be done but would result in double
-        // allocation; properly deallocating the preallocated buffer that backs
-        // the tensors is tricky and would leak the backend specific information
-        // into the general backend code.
-        // Does this create misaligned subbuffers (alignment is 1024) in certain
-        // cases ?
-        // The original tensor memory is divided into scales and quants, i.e.,
-        // we first store scales, then quants.
-        // Allocate separate buffers for each SoA component to avoid subbuffer
-        // alignment gaps that can push origins past the tensor's allocated region.
-        extra->d = clCreateBuffer(context, CL_MEM_READ_WRITE, size_d, NULL, &err);
+        // Sub-buffers: d at tensor's pool start, q immediately after.
+        region.origin = align_to(extra_orig->offset + tensor->view_offs + offset, backend_ctx->alignment);
+        region.size   = size_d;
+        extra->d = clCreateSubBuffer(extra_orig->data_device, CL_MEM_READ_WRITE,
+                                     CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
         CL_CHECK(err);
-        extra->q = clCreateBuffer(context, CL_MEM_READ_WRITE, size_q, NULL, &err);
+        region.origin = align_to(region.origin + size_d, backend_ctx->alignment);
+        region.size   = size_q;
+        extra->q = clCreateSubBuffer(extra_orig->data_device, CL_MEM_READ_WRITE,
+                                     CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
         CL_CHECK(err);
 
-        //cl_kernel kernel = backend_ctx->kernel_convert_block_q4_0;
-    #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
-        cl_kernel kernel = backend_ctx->kernel_convert_block_q4_0;
+        // Build SOA data in CPU buffers.
+        std::vector<uint8_t> soa_d(size_d);
+        std::vector<uint8_t> soa_q(size_q);
+        const size_t half_blk = per_q / 2;  // 8
 
-        // The optimized kernels need weights in natural order, so unshuffle.
-        if (use_adreno_kernels(backend_ctx, tensor)) {
-            kernel = backend_ctx->kernel_convert_block_q4_0_noshuffle;
+        // d component: one FP16 scale per block.
+        for (size_t i = 0; i < n_blks; i++) {
+            memcpy(soa_d.data() + i * per_d, src8 + i * stride, per_d);
         }
-    #else
-        cl_kernel kernel = backend_ctx->kernel_convert_block_q4_0;
-    #endif // GGML_OPENCL_USE_ADRENO_KERNELS
-        CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &data_device));
-        CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &extra->q));
-        CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &extra->d));
 
-        size_t num_blocks_q4_0 = (size_t)ggml_nelements(tensor)/ggml_blck_size(tensor->type);
-        size_t lws_q4_0 = 64;
-        while (lws_q4_0 > num_blocks_q4_0) { lws_q4_0 /= 2; }
-        if (lws_q4_0 == 0) { lws_q4_0 = 1; }
-        size_t global_work_size[] = {num_blocks_q4_0, 1, 1};
-        size_t local_work_size[] = {lws_q4_0, 1, 1};
-
-        cl_event evt;
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
-        CL_CHECK(clWaitForEvents(1, &evt));
-        CL_CHECK(clReleaseMemObject(data_device));
+        // q component: quantized nibbles, with optional Adreno nibble reordering.
+        // Replicates kernel_convert_block_q4_0_noshuffle:
+        //   q[j]          = (qs[2j] & 0x0F) | ((qs[2j+1] & 0x0F) << 4)
+        //   q[j+half_blk] = ((qs[2j] & 0xF0) >> 4) | (qs[2j+1] & 0xF0)
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+        if (use_adreno_kernels(backend_ctx, tensor)) {
+            for (size_t i = 0; i < n_blks; i++) {
+                const uint8_t * qs   = src8 + i * stride + per_d;
+                uint8_t       * dstq = soa_q.data() + i * per_q;
+                for (size_t j = 0; j < half_blk; j++) {
+                    uint8_t x0 = qs[2*j];
+                    uint8_t x1 = qs[2*j + 1];
+                    dstq[j]            = (x0 & 0x0F) | ((x1 & 0x0F) << 4);
+                    dstq[j + half_blk] = ((x0 & 0xF0) >> 4) | (x1 & 0xF0);
+                }
+            }
+        } else {
+            for (size_t i = 0; i < n_blks; i++) {
+                memcpy(soa_q.data() + i * per_q, src8 + i * stride + per_d, per_q);
+            }
+        }
+#else
+        GGML_UNUSED(half_blk);
+        for (size_t i = 0; i < n_blks; i++) {
+            memcpy(soa_q.data() + i * per_q, src8 + i * stride + per_d, per_q);
+        }
+#endif
 
         tensor->extra = extra;
 
-        // transpose the weights and scales
+        // Upload SOA data and transpose.
     #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
-        // Only do transpose for large, non batched matrix
-        // TODO: use preallocated images instead of sub-buffer then image
         if (use_adreno_kernels(backend_ctx, tensor)) {
-        // <----------------------------------------------------------------------------------> //
-        // start transpose
-        // <----------------------------------------------------------------------------------> //
+        // Transpose path.  Qualcomm's OpenCL driver does NOT support creating
+        // CL_MEM_OBJECT_IMAGE1D_BUFFER images from sub-buffers, so we use
+        // temporary standalone buffers as image sources, transpose into the
+        // prealloc buffers, then copy the transposed result back into the
+        // sub-buffers (extra->d, extra->q).  The standalones are released
+        // immediately after the transpose.
         int M = tensor->ne[1];   // ne01
         int K = tensor->ne[0];   // ne00
 
-        //For matrix-vector multiplication kernel, we assume K is a multiple of 32
         GGML_ASSERT(K % 32 == 0);
-        //For transpose kernels, we assume K is a multiple of 4 (satisfied by prior assert), and M is a multiple of 4
         GGML_ASSERT(M % 4 == 0);
 
-        // transpose is out of place, so we need to allocate transposed buffers
-        // <----------------------------------------------------------------------------------> //
-        // use sub_buffer of max buffer size instead
+        cl_kernel kernel;
+        cl_event evt;
 
+        // Source standalone buffers pre-allocated in ggml_cl2_init (before the
+        // model pool) so this grow-if-needed call is usually a no-op.
+        backend_ctx->prealloc_quant_src.allocate(context, size_q);
+        backend_ctx->prealloc_scales_src.allocate(context, size_d);
+        cl_mem q_src = backend_ctx->prealloc_quant_src.buffer;
+        cl_mem d_src = backend_ctx->prealloc_scales_src.buffer;
+        CL_CHECK(clEnqueueWriteBuffer(queue, d_src, CL_TRUE, 0, size_d, soa_d.data(), 0, NULL, NULL));
+        CL_CHECK(clEnqueueWriteBuffer(queue, q_src, CL_TRUE, 0, size_q, soa_q.data(), 0, NULL, NULL));
+
+        // Allocate transposed output buffers (prealloc pool, sub-buffers).
         size_t q_size_bytes = K * M / 8 * sizeof(float);
         backend_ctx->prealloc_quant_trans.allocate(context, q_size_bytes);
 
-        cl_buffer_region region;
-        region.origin = 0;
-        region.size = q_size_bytes;
+        cl_buffer_region trans_region;
+        trans_region.origin = 0;
+        trans_region.size = q_size_bytes;
         cl_mem qT_d = clCreateSubBuffer(
-            backend_ctx->prealloc_quant_trans.buffer,
-            0,
-            CL_BUFFER_CREATE_TYPE_REGION,
-            &region,
-            &err);
+            backend_ctx->prealloc_quant_trans.buffer, 0,
+            CL_BUFFER_CREATE_TYPE_REGION, &trans_region, &err);
         CL_CHECK(err);
 
-        bool K_tile_trans = true;
-        if ((K / 32) % 4 != 0){
-            K_tile_trans =false;
-        }
+        bool K_tile_trans = ((K / 32) % 4 == 0);
 
         size_t d_size_bytes = M * (K / 32) * 2;
         backend_ctx->prealloc_scales_trans.allocate(context, d_size_bytes);
 
-        region.origin = 0;
-        region.size = d_size_bytes;
+        trans_region.origin = 0;
+        trans_region.size = d_size_bytes;
         cl_mem dT_d = clCreateSubBuffer(
-            backend_ctx->prealloc_scales_trans.buffer,
-            0,
-            CL_BUFFER_CREATE_TYPE_REGION,
-            &region,
-            &err);
+            backend_ctx->prealloc_scales_trans.buffer, 0,
+            CL_BUFFER_CREATE_TYPE_REGION, &trans_region, &err);
         CL_CHECK(err);
 
-        // <----------------------------------------------------------------------------------> //
-
-
-        // create images from the buffers
-        // <----------------------------------------------------------------------------------> //
+        // Create images from standalone buffers (not sub-buffers).
         cl_mem q_d_image1D;
         cl_mem d_d_image1D;
         cl_mem qT_d_image1D;
@@ -4908,47 +4930,44 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         cl_image_desc img_desc_1d;
 
         memset(&img_desc_1d, 0, sizeof(img_desc_1d));
-        img_desc_1d.image_type = CL_MEM_OBJECT_IMAGE1D_BUFFER;
+        img_desc_1d.image_type  = CL_MEM_OBJECT_IMAGE1D_BUFFER;
         img_desc_1d.image_width = M * K / 4 / 4;
-        img_desc_1d.buffer = extra->q;
+        img_desc_1d.buffer      = q_src;  // standalone — image creation succeeds
         q_d_image1D = clCreateImage(context, 0, &img_fmt_1d, &img_desc_1d, NULL, &err);
         CL_CHECK(err);
 
-        img_fmt_1d = { CL_RGBA, CL_HALF_FLOAT };
         memset(&img_desc_1d, 0, sizeof(img_desc_1d));
-        img_desc_1d.image_type = CL_MEM_OBJECT_IMAGE1D_BUFFER;
+        img_fmt_1d              = { CL_RGBA, CL_HALF_FLOAT };
+        img_desc_1d.image_type  = CL_MEM_OBJECT_IMAGE1D_BUFFER;
         img_desc_1d.image_width = M * K / 4 / 4;
-        img_desc_1d.buffer = qT_d;
+        img_desc_1d.buffer      = qT_d;
         qT_d_image1D = clCreateImage(context, 0, &img_fmt_1d, &img_desc_1d, NULL, &err);
         CL_CHECK(err);
 
         memset(&img_desc_1d, 0, sizeof(img_desc_1d));
         if (K_tile_trans) {
-            img_fmt_1d = { CL_RGBA, CL_HALF_FLOAT };
+            img_fmt_1d              = { CL_RGBA, CL_HALF_FLOAT };
             img_desc_1d.image_width = M * K / 32 / 4;
         } else {
-            img_fmt_1d = { CL_R, CL_HALF_FLOAT };
+            img_fmt_1d              = { CL_R, CL_HALF_FLOAT };
             img_desc_1d.image_width = M * K / 32;
         }
         img_desc_1d.image_type = CL_MEM_OBJECT_IMAGE1D_BUFFER;
-        img_desc_1d.buffer = extra->d;
+        img_desc_1d.buffer     = d_src;  // standalone — image creation succeeds
         d_d_image1D = clCreateImage(context, 0, &img_fmt_1d, &img_desc_1d, NULL, &err);
         CL_CHECK(err);
 
-        img_fmt_1d = { CL_RGBA, CL_HALF_FLOAT };
         memset(&img_desc_1d, 0, sizeof(img_desc_1d));
-        img_desc_1d.image_type = CL_MEM_OBJECT_IMAGE1D_BUFFER;
+        img_fmt_1d              = { CL_RGBA, CL_HALF_FLOAT };
+        img_desc_1d.image_type  = CL_MEM_OBJECT_IMAGE1D_BUFFER;
         img_desc_1d.image_width = M * K / 32 / 4;
-        img_desc_1d.buffer = dT_d;
+        img_desc_1d.buffer      = dT_d;
         dT_d_image1D = clCreateImage(context, 0, &img_fmt_1d, &img_desc_1d, NULL, &err);
         CL_CHECK(err);
-        // <----------------------------------------------------------------------------------> //
 
-        // set up and call the transpose kernels
-        // <----------------------------------------------------------------------------------> //
-        // weights
+        // Transpose weights.
         int height_q = M / 4;
-        int width_q = K / 4 / 4;
+        int width_q  = K / 4 / 4;
         kernel = backend_ctx->kernel_transpose_16;
 
         CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &q_d_image1D));
@@ -4956,56 +4975,49 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         CL_CHECK(clSetKernelArg(kernel, 2, sizeof(int),    &height_q));
         CL_CHECK(clSetKernelArg(kernel, 3, sizeof(int),    &width_q));
 
-        size_t local_size_q[3] = {4, 16, 1};
+        size_t local_size_q[3]  = {4, 16, 1};
         size_t global_size_q[3] = {static_cast<size_t>(width_q), static_cast<size_t>(height_q), 1};
         CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_size_q, local_size_q, 0, NULL, &evt));
         CL_CHECK(clWaitForEvents(1, &evt));
 
-        // scales
+        // Transpose scales.
         int height_s = M / 4;
-        int width_s = K / 32 / 4;
+        int width_s  = K_tile_trans ? K / 32 / 4 : K / 32;
 
-        kernel = backend_ctx->kernel_transpose_16;
-        if (!K_tile_trans) {
-            kernel = backend_ctx->kernel_transpose_16_4x1;
-            width_s = K / 32;
-        }
+        kernel = K_tile_trans ? backend_ctx->kernel_transpose_16 : backend_ctx->kernel_transpose_16_4x1;
         CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &d_d_image1D));
         CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &dT_d_image1D));
         CL_CHECK(clSetKernelArg(kernel, 2, sizeof(int), &height_s));
         CL_CHECK(clSetKernelArg(kernel, 3, sizeof(int), &width_s));
 
-        size_t local_size_s[3] = {4, 16, 1};
+        size_t local_size_s[3]  = {4, 16, 1};
         size_t global_size_s[3] = {static_cast<size_t>(width_s), static_cast<size_t>(height_s), 1};
         CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_size_s, local_size_s, 0, NULL, &evt));
         CL_CHECK(clWaitForEvents(1, &evt));
-        // <----------------------------------------------------------------------------------> //
 
-        // copy transposed buffer contents to original buffers
-        // <----------------------------------------------------------------------------------> //
-        // weights
+        // Copy transposed data into the sub-buffers (clEnqueueCopyBuffer to
+        // a sub-buffer is valid even on Qualcomm).
         CL_CHECK(clEnqueueCopyBuffer(queue, qT_d, extra->q, 0, 0, q_size_bytes, 0, NULL, &evt));
         CL_CHECK(clWaitForEvents(1, &evt));
-
-        // scales
         CL_CHECK(clEnqueueCopyBuffer(queue, dT_d, extra->d, 0, 0, d_size_bytes, 0, NULL, &evt));
         CL_CHECK(clWaitForEvents(1, &evt));
-        // <----------------------------------------------------------------------------------> //
 
-        // deallocate transpose buffers
-        // <----------------------------------------------------------------------------------> //
+        // Release sub-buffers and images (prealloc_quant_src/scales_src are
+        // persistent — do NOT release them here).
         CL_CHECK(clReleaseMemObject(qT_d));
         CL_CHECK(clReleaseMemObject(dT_d));
-
-        // deallocate temporary images
         CL_CHECK(clReleaseMemObject(q_d_image1D));
         CL_CHECK(clReleaseMemObject(d_d_image1D));
         CL_CHECK(clReleaseMemObject(qT_d_image1D));
         CL_CHECK(clReleaseMemObject(dT_d_image1D));
-        // <----------------------------------------------------------------------------------> //
-        // end transpose
-        // <----------------------------------------------------------------------------------> //
+        } else {
+        // No transpose: upload SOA data directly into the sub-buffers.
+        CL_CHECK(clEnqueueWriteBuffer(queue, extra->d, CL_TRUE, 0, size_d, soa_d.data(), 0, NULL, NULL));
+        CL_CHECK(clEnqueueWriteBuffer(queue, extra->q, CL_TRUE, 0, size_q, soa_q.data(), 0, NULL, NULL));
         }
+    #else
+        CL_CHECK(clEnqueueWriteBuffer(queue, extra->d, CL_TRUE, 0, size_d, soa_d.data(), 0, NULL, NULL));
+        CL_CHECK(clEnqueueWriteBuffer(queue, extra->q, CL_TRUE, 0, size_q, soa_q.data(), 0, NULL, NULL));
     #endif // GGML_OPENCL_USE_ADRENO_KERNELS
 
         return;
@@ -5440,14 +5452,13 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         // Only convert full tensor writes (weight loading).  Partial writes
         // (e.g. KV-cache updates) bypass SOA and fall through to the pool write.
         //
-        // Adreno is intentionally excluded: profiling shows the flat kernel is
-        // ~30% slower than the packed kernel on Adreno (67 t/s vs 96 t/s on 1B
-        // Q4_K_M), because the packed kernel uses a divergence-free ushort-based
-        // scale decode whereas the flat kernel evaluates both branches of each
-        // ternary unconditionally.  Additionally, SOA buffers double the Q4_K
-        // GPU memory footprint, which causes OOM on 7B+ models that also have
-        // Q6_K tensors.  Re-enable (add || gpu_family == ADRENO) only after
-        // rewriting the scale decode to use the packed kernel's ushort approach.
+        // Adreno is intentionally excluded: benchmarks show the flat kernel is
+        // ~40% slower than the packed Adreno kernel (56 t/s vs 95 t/s on 1B
+        // Q4_K_M) even after coalescing the thread mapping (ix=lid/16) and
+        // rewriting scale decode to use 3 aligned ushort reads instead of
+        // divergent byte reads.  The packed Adreno kernel uses image-based
+        // access patterns that the flat SOA kernel cannot replicate.  Additionally,
+        // SOA buffers double Q4_K GPU memory → OOM risk on 7B+ with Q6_K tensors.
         ggml_tensor_extra_cl * extra_orig = (ggml_tensor_extra_cl *)tensor->extra;
         GGML_ASSERT(extra_orig && "Tensors in OpenCL backend should have been allocated and initialized");
 
@@ -5516,59 +5527,74 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         GGML_ASSERT(size_ql + size_qh + size_s + size_d == ggml_nbytes(tensor) &&
             "Incorrect tensor size");
 
+        // CPU-side AoS→SOA using sub-buffers of the main pool: no extra GPU memory
+        // needed. Each block_q6_K: [ql(128 B) | qh(64 B) | scales(16 B) | d(2 B)] = 210 B.
+        // Sub-buffer origins must be 128-aligned; for real LLM weight matrices (n_blocks
+        // is always a large multiple) all component sizes are naturally 128-aligned.
+        const uint8_t * src8      = (const uint8_t *)data;
+        const size_t    n_blocks  = ggml_nelements(tensor) / ggml_blck_size(tensor->type);
+        const size_t    stride    = ggml_nbytes(tensor) / n_blocks;  // 210 bytes
+        const size_t    off_qh    = size_ql / n_blocks;              // 128
+        const size_t    off_s     = off_qh + size_qh / n_blocks;     // 192
+        const size_t    off_d     = off_s  + size_s  / n_blocks;     // 208
+
         cl_int err;
-        cl_mem data_device;
-        CL_CHECK((data_device = clCreateBuffer(context, CL_MEM_READ_WRITE, ggml_nbytes(tensor), NULL, &err), err));
-        CL_CHECK(clEnqueueWriteBuffer(queue, data_device, CL_TRUE, 0, ggml_nbytes(tensor), data, 0, NULL, NULL));
+        cl_buffer_region region;
 
-        // Allocate separate buffers for each SoA component.
-        // We do not use subbuffers of the original tensor buffer here because
-        // subbuffers require aligned origins, and the cumulative alignment gaps
-        // can push a subbuffer origin past the tensor's allocated region,
-        // causing it to alias into an adjacent tensor's memory (which would
-        // then corrupt the SoA data when that tensor is written).
-        extra->ql = clCreateBuffer(context, CL_MEM_READ_WRITE, size_ql, NULL, &err);
-        CL_CHECK(err);
-        extra->qh = clCreateBuffer(context, CL_MEM_READ_WRITE, size_qh, NULL, &err);
-        CL_CHECK(err);
-        extra->s  = clCreateBuffer(context, CL_MEM_READ_WRITE, size_s,  NULL, &err);
-        CL_CHECK(err);
-        extra->d  = clCreateBuffer(context, CL_MEM_READ_WRITE, size_d,  NULL, &err);
+        // ql: at tensor's aligned start in main pool.
+        region.origin = align_to(extra_orig->offset + tensor->view_offs + offset, backend_ctx->alignment);
+        region.size   = size_ql;
+        extra->ql = clCreateSubBuffer(extra_orig->data_device, CL_MEM_READ_WRITE,
+                                      CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
         CL_CHECK(err);
 
-        // Flatten the weights
-        cl_kernel kernel;
-#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
-        kernel = backend_ctx->kernel_convert_block_q6_K;
-        if (use_adreno_kernels(backend_ctx, tensor)) {
-            kernel = backend_ctx->kernel_convert_block_q6_K_noshuffle;
+        region.origin = align_to(region.origin + size_ql, backend_ctx->alignment);
+        region.size   = size_qh;
+        extra->qh = clCreateSubBuffer(extra_orig->data_device, CL_MEM_READ_WRITE,
+                                      CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
+        CL_CHECK(err);
+
+        region.origin = align_to(region.origin + size_qh, backend_ctx->alignment);
+        region.size   = size_s;
+        extra->s  = clCreateSubBuffer(extra_orig->data_device, CL_MEM_READ_WRITE,
+                                      CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
+        CL_CHECK(err);
+
+        region.origin = align_to(region.origin + size_s, backend_ctx->alignment);
+        region.size   = size_d;
+        extra->d  = clCreateSubBuffer(extra_orig->data_device, CL_MEM_READ_WRITE,
+                                      CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
+        CL_CHECK(err);
+
+        // Flatten each component one at a time (peak CPU alloc = size_ql ≈ 61% of tensor).
+        {
+            std::vector<uint8_t> tmp(size_ql);
+            for (size_t i = 0; i < n_blocks; i++) {
+                memcpy(tmp.data() + i * off_qh, src8 + i * stride, off_qh);
+            }
+            CL_CHECK(clEnqueueWriteBuffer(queue, extra->ql, CL_TRUE, 0, size_ql, tmp.data(), 0, NULL, NULL));
         }
-#else
-        kernel = backend_ctx->kernel_convert_block_q6_K;
-#endif // GGML_OPENCL_USE_ADRENO_KERNELS
-
-        cl_uchar mask = 0xff;
-        cl_ulong n_blk = ggml_nelements(tensor)/ggml_blck_size(tensor->type);
-        CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &data_device));
-        CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem),   &extra->ql));
-        CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &extra->qh));
-        CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem),   &extra->s));
-        CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_mem),   &extra->d));
-        CL_CHECK(clSetKernelArg(kernel, 5, sizeof(cl_uchar), &mask));
-        CL_CHECK(clSetKernelArg(kernel, 6, sizeof(cl_ulong), &n_blk));
-
-        size_t num_blocks_q6 = (size_t)ggml_nelements(tensor)/ggml_blck_size(tensor->type);
-        size_t lws_q6 = 64;
-        // local work size must not exceed global work size (required by OpenCL spec)
-        while (lws_q6 > num_blocks_q6) { lws_q6 /= 2; }
-        if (lws_q6 == 0) { lws_q6 = 1; }
-        size_t global_work_size[] = {num_blocks_q6, 1, 1};
-        size_t local_work_size[] = {lws_q6, 1, 1};
-
-        cl_event evt;
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
-        CL_CHECK(clWaitForEvents(1, &evt));
-        CL_CHECK(clReleaseMemObject(data_device));
+        {
+            std::vector<uint8_t> tmp(size_qh);
+            for (size_t i = 0; i < n_blocks; i++) {
+                memcpy(tmp.data() + i * (off_s - off_qh), src8 + i * stride + off_qh, off_s - off_qh);
+            }
+            CL_CHECK(clEnqueueWriteBuffer(queue, extra->qh, CL_TRUE, 0, size_qh, tmp.data(), 0, NULL, NULL));
+        }
+        {
+            std::vector<uint8_t> tmp(size_s);
+            for (size_t i = 0; i < n_blocks; i++) {
+                memcpy(tmp.data() + i * (off_d - off_s), src8 + i * stride + off_s, off_d - off_s);
+            }
+            CL_CHECK(clEnqueueWriteBuffer(queue, extra->s, CL_TRUE, 0, size_s, tmp.data(), 0, NULL, NULL));
+        }
+        {
+            std::vector<uint8_t> tmp(size_d);
+            for (size_t i = 0; i < n_blocks; i++) {
+                memcpy(tmp.data() + i * (stride - off_d), src8 + i * stride + off_d, stride - off_d);
+            }
+            CL_CHECK(clEnqueueWriteBuffer(queue, extra->d, CL_TRUE, 0, size_d, tmp.data(), 0, NULL, NULL));
+        }
 
 
         extra->size_ql = size_ql;
@@ -6030,7 +6056,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
         ((ggml_backend_opencl_buffer_context*)tensor->buffer->context)->soa_q4_K_tensors.count(tensor) > 0) {
         // Only enter this path when the tensor was successfully converted to SOA
         // (tracked in soa_q4_K_tensors). Tensors that stayed packed (e.g. Adreno
-        // without flat kernel, or OOM fallback) fall through to the default read.
+        // excluded from flat kernel, or OOM fallback) fall through to default read.
         ggml_tensor_extra_cl_q4_K * extra = (ggml_tensor_extra_cl_q4_K *)tensor->extra;
 
         if (backend_ctx->device_name.find("NVIDIA") != std::string::npos) {
