@@ -29,6 +29,7 @@
 #include <memory>
 #include <charconv>
 #include <mutex>
+#include <unordered_set>
 
 #undef MIN
 #undef MAX
@@ -1386,8 +1387,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
         GGML_LOG_CONT(".");
     }
 
-    // mul_mv_q4_k_f32_flat
-    {
+    // mul_mv_q4_k_f32_flat (NVIDIA + Adreno SOA flat kernel)
+#ifdef GGML_OPENCL_SOA_Q
+    if (backend_ctx->device_name.find("NVIDIA") != std::string::npos ||
+        backend_ctx->gpu_family == ADRENO) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
         const std::string kernel_src {
             #include "mul_mv_q4_k_f32_flat.cl.h"
@@ -4639,6 +4642,11 @@ struct ggml_backend_opencl_buffer_context {
     std::vector<ggml_tensor_extra_cl_q8_0 *> temp_tensor_extras_q8_0_in_use;
     std::vector<ggml_tensor_extra_cl_q4_K *> temp_tensor_extras_q4_K;
     std::vector<ggml_tensor_extra_cl_q4_K *> temp_tensor_extras_q4_K_in_use;
+
+    // Tracks tensors whose Q4_K data was successfully converted to SOA format.
+    // When a tensor is NOT in this set (e.g., SOA allocation failed due to OOM),
+    // mul_mat falls back to the packed kernel using the pool buffer.
+    std::unordered_set<const ggml_tensor *> soa_q4_K_tensors;
     std::vector<ggml_tensor_extra_cl_q6_K *> temp_tensor_extras_q6_K;
     std::vector<ggml_tensor_extra_cl_q6_K *> temp_tensor_extras_q6_K_in_use;
 
@@ -5426,24 +5434,38 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
 
         return;
     }
-    if (tensor->type == GGML_TYPE_Q4_K) {
+    if (tensor->type == GGML_TYPE_Q4_K &&
+        offset == 0 && size == ggml_nbytes(tensor) &&
+        backend_ctx->device_name.find("NVIDIA") != std::string::npos) {
+        // Only convert full tensor writes (weight loading).  Partial writes
+        // (e.g. KV-cache updates) bypass SOA and fall through to the pool write.
+        // NOTE: Adreno Q4_K flat kernel is currently disabled because:
+        //   1. It is slower than the packed kernel on Adreno (regression).
+        //   2. Allocating SOA buffers for all Q4_K tensors raises total GPU
+        //      memory usage enough to OOM the Q6_K SOA allocation that follows.
+        // When an Adreno-tuned flat Q4_K kernel is available, re-enable by
+        // adding `|| backend_ctx->gpu_family == ADRENO` to the condition above
+        // and verify with models that contain both Q4_K and Q6_K tensors.
         ggml_tensor_extra_cl * extra_orig = (ggml_tensor_extra_cl *)tensor->extra;
         GGML_ASSERT(extra_orig && "Tensors in OpenCL backend should have been allocated and initialized");
 
         ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
         ggml_tensor_extra_cl_q4_K * extra = ctx->ggml_opencl_alloc_temp_tensor_extra_q4_K();
 
-        if (backend_ctx->device_name.find("NVIDIA") != std::string::npos) {
-            // NVIDIA path: allocate separate SOA buffers
-            size_t n_blocks   = (size_t)ggml_nelements(tensor) / ggml_blck_size(tensor->type);
-            size_t size_qs    = n_blocks * 128;   // QK_K/2
-            size_t size_scales = n_blocks * 12;   // K_SCALE_SIZE
-            size_t size_d     = n_blocks * sizeof(ggml_fp16_t);
-            size_t size_dmin  = n_blocks * sizeof(ggml_fp16_t);
-            GGML_ASSERT(size_qs + size_scales + size_d + size_dmin == ggml_nbytes(tensor) &&
-                "Incorrect Q4_K tensor size");
+        size_t n_blocks    = (size_t)ggml_nelements(tensor) / ggml_blck_size(tensor->type);
+        size_t size_qs     = n_blocks * 128;   // QK_K/2
+        size_t size_scales = n_blocks * 12;    // K_SCALE_SIZE
+        size_t size_d      = n_blocks * sizeof(ggml_fp16_t);
+        size_t size_dmin   = n_blocks * sizeof(ggml_fp16_t);
+        GGML_ASSERT(size_qs + size_scales + size_d + size_dmin == ggml_nbytes(tensor) &&
+            "Incorrect Q4_K tensor size");
 
-            cl_int err;
+        cl_int err;
+
+        if (backend_ctx->device_name.find("NVIDIA") != std::string::npos) {
+            // NVIDIA: GPU-side conversion via convert kernel.
+            // Uploads packed AoS data to a temporary buffer, runs the convert
+            // kernel to scatter into 4 SOA buffers, then releases the temp buffer.
             cl_mem data_device = clCreateBuffer(context, CL_MEM_READ_WRITE,
                 ggml_nbytes(tensor), NULL, &err);
             CL_CHECK(err);
@@ -5473,106 +5495,10 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
             extra->size_scales = size_scales;
             extra->size_d      = size_d;
             extra->size_dmin   = size_dmin;
-
             tensor->extra = extra;
-        } else {
-            // Adreno/Intel path: subbuffer-based init
-            size_t size_d  = ggml_nelements(tensor)/ggml_blck_size(tensor->type)*sizeof(ggml_fp16_t);
-            size_t size_dmin = ggml_nelements(tensor)/ggml_blck_size(tensor->type)*sizeof(ggml_fp16_t);
-            size_t size_scales = ggml_nelements(tensor)/ggml_blck_size(tensor->type)*(3 * ggml_blck_size(tensor->type) / 64);
-            size_t size_qs = ggml_nelements(tensor)/ggml_blck_size(tensor->type)*ggml_blck_size(tensor->type)/2;
-            GGML_ASSERT(size_d + size_dmin + size_scales + size_qs == ggml_nbytes(tensor) && "Incorrect tensor size");
-
-            cl_int err;
-            cl_mem data_device = clCreateBuffer(context, CL_MEM_READ_WRITE,
-                ggml_nbytes(tensor), NULL, &err);
-            CL_CHECK(err);
-            CL_CHECK(clEnqueueWriteBuffer(
-                queue, data_device, CL_TRUE, 0,
-                ggml_nbytes(tensor), data, 0, NULL, NULL));
-
-            cl_buffer_region region;
-
-            // Create subbuffer for d.
-            region.origin = align_to(extra_orig->offset + tensor->view_offs + offset, backend_ctx->alignment);
-            region.size = size_d;
-            extra->d = clCreateSubBuffer(
-                extra_orig->data_device, CL_MEM_READ_WRITE,
-                CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
-            CL_CHECK(err);
-            auto previous_origin = region.origin;
-
-            // Create subbuffer for mins.
-            region.origin = align_to(previous_origin + size_d, backend_ctx->alignment);
-            region.size = size_dmin;
-            extra->dmin = clCreateSubBuffer(
-                extra_orig->data_device, CL_MEM_READ_WRITE,
-                CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
-            CL_CHECK(err);
-            previous_origin = region.origin;
-
-            // Create subbuffer for scales.
-            region.origin = align_to(previous_origin + size_dmin, backend_ctx->alignment);
-            region.size = size_scales;
-            extra->scales = clCreateSubBuffer(
-                extra_orig->data_device, CL_MEM_READ_WRITE,
-                CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
-            CL_CHECK(err);
-            previous_origin = region.origin;
-
-            // Create subbuffer for quants.
-            region.origin = align_to(previous_origin + size_scales, backend_ctx->alignment);
-            region.size = size_qs;
-            extra->qs = clCreateSubBuffer(
-                extra_orig->data_device, CL_MEM_READ_WRITE,
-                CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
-            CL_CHECK(err);
-
-            #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
-            cl_kernel kernel = backend_ctx->kernel_convert_block_q4_K;
-            if (use_adreno_kernels(backend_ctx, tensor)) {
-                kernel = backend_ctx->kernel_convert_block_q4_K_noshuffle;
-            }
-            #else
-            cl_kernel kernel = backend_ctx->kernel_convert_block_q4_K;
-            #endif
-
-            cl_uchar mask_0F = 0x0F;
-            cl_uchar mask_F0 = 0xF0;
-
-            CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &data_device));
-            CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &extra->qs));
-            CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &extra->scales));
-            CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem), &extra->d));
-            CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_mem), &extra->dmin));
-            CL_CHECK(clSetKernelArg(kernel, 5, sizeof(cl_uchar), &mask_0F));
-            CL_CHECK(clSetKernelArg(kernel, 6, sizeof(cl_uchar), &mask_F0));
-
-            size_t global_work_size[] = {(size_t)ggml_nelements(tensor)/ggml_blck_size(tensor->type), 1, 1};
-            size_t local_work_size[] = {64, 1, 1};
-
-            cl_event evt;
-            CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
-            CL_CHECK(clWaitForEvents(1, &evt));
-            CL_CHECK(clReleaseMemObject(data_device));
-
-            tensor->extra  = extra;
-    #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
-            if (use_adreno_kernels(backend_ctx, tensor)) {
-
-                int M = tensor->ne[1];
-                int K = tensor->ne[0];
-
-                GGML_ASSERT(K % 32 == 0);
-
-                // Transpose qs, d, dmin as ushort
-                transpose_2d_as_16b(backend_ctx, extra->qs,   extra->qs,   size_qs,   K/4, M);
-                transpose_2d_as_16b(backend_ctx, extra->d,    extra->d,    size_d,    K/256, M);
-                transpose_2d_as_16b(backend_ctx, extra->dmin, extra->dmin, size_dmin, K/256, M);
-            }
-    #endif // GGML_OPENCL_USE_ADRENO_KERNELS
+            ctx->soa_q4_K_tensors.insert(tensor);
+            return;
         }
-        return;
     }
     if (tensor->type == GGML_TYPE_Q6_K) {
         ggml_tensor_extra_cl * extra_orig = (ggml_tensor_extra_cl *)tensor->extra;
@@ -6099,32 +6025,58 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
         return;
     }
     if (tensor->type == GGML_TYPE_Q4_K &&
-        ggml_opencl_uses_local_subgroup_compat(backend_ctx)) {
+        tensor->buffer != nullptr &&
+        ((ggml_backend_opencl_buffer_context*)tensor->buffer->context)->soa_q4_K_tensors.count(tensor) > 0) {
+        // Only enter this path when the tensor was successfully converted to SOA
+        // (tracked in soa_q4_K_tensors). Tensors that stayed packed (e.g. Adreno
+        // without flat kernel, or OOM fallback) fall through to the default read.
         ggml_tensor_extra_cl_q4_K * extra = (ggml_tensor_extra_cl_q4_K *)tensor->extra;
 
-        cl_int err;
-        cl_mem data_device = clCreateBuffer(context, CL_MEM_READ_WRITE,
-            ggml_nbytes(tensor), NULL, &err);
-        CL_CHECK(err);
+        if (backend_ctx->device_name.find("NVIDIA") != std::string::npos) {
+            // NVIDIA: GPU-side SOA→AoS restore via kernel.
+            cl_int err;
+            cl_mem data_device = clCreateBuffer(context, CL_MEM_READ_WRITE,
+                ggml_nbytes(tensor), NULL, &err);
+            CL_CHECK(err);
 
-        cl_kernel kernel = backend_ctx->kernel_restore_block_q4_K;
-        CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &extra->d));
-        CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &extra->dmin));
-        CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &extra->scales));
-        CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem), &extra->qs));
-        CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_mem), &data_device));
+            cl_kernel kernel = backend_ctx->kernel_restore_block_q4_K;
+            CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &extra->d));
+            CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &extra->dmin));
+            CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &extra->scales));
+            CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem), &extra->qs));
+            CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_mem), &data_device));
 
-        size_t global_work_size[] = {(size_t)ggml_nelements(tensor)/ggml_blck_size(tensor->type), 1, 1};
-        size_t local_work_size[] = {1, 1, 1};
+            size_t global_work_size[] = {(size_t)ggml_nelements(tensor)/ggml_blck_size(tensor->type), 1, 1};
+            size_t local_work_size[] = {1, 1, 1};
 
-        cl_event evt;
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL,
-            global_work_size, local_work_size, 0, NULL, &evt));
-        CL_CHECK(clWaitForEvents(1, &evt));
-        CL_CHECK(clEnqueueReadBuffer(
-            queue, data_device, CL_TRUE, offset,
-            size, data, 0, NULL, NULL));
-        CL_CHECK(clReleaseMemObject(data_device));
+            cl_event evt;
+            CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL,
+                global_work_size, local_work_size, 0, NULL, &evt));
+            CL_CHECK(clWaitForEvents(1, &evt));
+            CL_CHECK(clEnqueueReadBuffer(
+                queue, data_device, CL_TRUE, offset,
+                size, data, 0, NULL, NULL));
+            CL_CHECK(clReleaseMemObject(data_device));
+        } else {
+            // Adreno: CPU-side SOA→AoS restore — symmetric with set_tensor.
+            size_t n_blocks = (size_t)ggml_nelements(tensor) / ggml_blck_size(tensor->type);
+            std::vector<uint8_t>  h_qs(extra->size_qs), h_scales(extra->size_scales);
+            std::vector<uint16_t> h_d(n_blocks), h_dmin(n_blocks);
+
+            CL_CHECK(clEnqueueReadBuffer(queue, extra->qs,     CL_TRUE, 0, extra->size_qs,     h_qs.data(),     0, NULL, NULL));
+            CL_CHECK(clEnqueueReadBuffer(queue, extra->scales, CL_TRUE, 0, extra->size_scales, h_scales.data(), 0, NULL, NULL));
+            CL_CHECK(clEnqueueReadBuffer(queue, extra->d,      CL_TRUE, 0, extra->size_d,      h_d.data(),      0, NULL, NULL));
+            CL_CHECK(clEnqueueReadBuffer(queue, extra->dmin,   CL_TRUE, 0, extra->size_dmin,   h_dmin.data(),   0, NULL, NULL));
+
+            uint8_t * dst_ptr = (uint8_t *)data + offset;
+            for (size_t i = 0; i < n_blocks; ++i) {
+                uint8_t * blk = dst_ptr + i * 144;
+                memcpy(blk,      &h_d[i],                      2);
+                memcpy(blk + 2,  &h_dmin[i],                   2);
+                memcpy(blk + 4,  h_scales.data() + i * 12,     12);
+                memcpy(blk + 16, h_qs.data()     + i * 128,    128);
+            }
+        }
         return;
     }
     if (tensor->type == GGML_TYPE_Q6_K) {
@@ -12097,11 +12049,23 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         case GGML_TYPE_Q3_K:
         case GGML_TYPE_Q4_K: {
 #ifdef GGML_OPENCL_SOA_Q
-            if (src0t == GGML_TYPE_Q4_K && ggml_opencl_uses_local_subgroup_compat(backend_ctx)) {
+            // Use the flat SOA kernel only if the tensor was actually converted to SOA
+            // (set_tensor marks successful conversions in soa_q4_K_tensors).
+            // On OOM fallback the tensor stays packed in the pool buffer and uses
+            // the generic packed kernel below.
+            if (src0t == GGML_TYPE_Q4_K &&
+                src0->buffer != nullptr &&
+                ((ggml_backend_opencl_buffer_context*)src0->buffer->context)->soa_q4_K_tensors.count(src0) > 0) {
                 kernel = backend_ctx->kernel_mul_mv_q4_K_f32_flat;
-                nth0 = 32;  // one warp; __local tree-reduction
-                nth1 = 1;
                 ndst = 4;
+
+                if (backend_ctx->device_name.find("NVIDIA") != std::string::npos) {
+                    nth0 = 32;  // one warp; __local tree-reduction
+                    nth1 = 1;
+                } else {
+                    nth0 = 64;  // Adreno: one full wavefront; sub_group_reduce_add
+                    nth1 = 1;
+                }
 
                 int ne02_i = (int)src0->ne[2];
                 CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0_q4_K->qs));

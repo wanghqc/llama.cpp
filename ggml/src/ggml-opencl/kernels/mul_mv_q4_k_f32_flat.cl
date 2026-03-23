@@ -1,7 +1,8 @@
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 
-#ifndef NVIDIA_GPU
-
+// Subgroup extensions — same detection pattern as mul_mv_q6_k_f32_flat.cl.
+// NVIDIA does not expose cl_khr_subgroups as a compile-time macro, so the
+// pragma is skipped there; NVIDIA uses __local tree-reduction instead.
 #ifdef cl_intel_subgroups
 #pragma OPENCL EXTENSION cl_intel_subgroups : enable
 #else
@@ -20,190 +21,11 @@
 #define REQD_SUBGROUP_SIZE_128 __attribute__((qcom_reqd_sub_group_size("full")))
 #endif
 
-//------------------------------------------------------------------------------
-// block_q4_K
-//------------------------------------------------------------------------------
-#define QK_K            256
-#define BLOCK_Q4K_SIZE  144
-#define K_SCALE_SIZE    12
-
-// 8 blocks of 32 elements each
-// weight is represented as x = a * q + b
-typedef struct {
-    half d;    // super-block scale for quantized scales
-    half dmin; // super-block scale for quantized mins
-
-    uchar scales[K_SCALE_SIZE]; // scales and mins, quantized with 6 bits
-    uchar qs[QK_K/2];           // 4-bit quants
-} block_q4_K;
-
-#undef N_DST
-#undef N_SIMDGROUP
-#undef N_SIMDWIDTH
-
-#ifdef INTEL_GPU
-#define N_DST 4 // number of rows each SIMD group works on
-#define N_SIMDGROUP 1 // number of SIMD groups in a thread group
-#define N_SIMDWIDTH 16 // SIMD group size
-#elif defined (ADRENO_GPU)
-#define N_DST 16
-#define N_SIMDGROUP 2
-#define N_SIMDWIDTH 64
-#endif
-
-#undef  BLOCK_STRIDE
-// number of (super) blocks each subgroup processes
-// each thread in a subgroup processes a block (32 weights)
-#define BLOCK_STRIDE (N_SIMDWIDTH/8)
-
-#ifdef INTEL_GPU
-REQD_SUBGROUP_SIZE_16
-#elif defined (ADRENO_GPU)
-REQD_SUBGROUP_SIZE_64
-#endif
-kernel void kernel_mul_mv_q4_K_f32_flat(
-    global uchar * src0_q,
-    global uchar * src0_s,
-    global half  * src0_d,
-    global half  * src0_dm,
-    global char  * src1,
-    int offset1,
-    global char  * dst,
-    int offsetd,
-    int ne00,
-    int ne01,
-    ulong nb01,
-    ulong nb02,
-    ulong nb03,
-    int ne12,
-    ulong nb11,
-    ulong nb12,
-    ulong nb13,
-    int ne0,
-    int ne1,
-    int r2,
-    int r3
-) {
-    src1 = src1 + offset1;
-    dst  = dst  + offsetd;
-
-    ushort kmask1 = 0x3f3f;
-    ushort kmask2 = 0x0f0f;
-    ushort kmask3 = 0xc0c0;
-
-    int ix = get_sub_group_local_id()/8;
-    int it = get_sub_group_local_id()%8;
-    int iq = it/4;
-    int ir = it%4;
-
-    int nb = ne00/QK_K;
-
-    int r0 = get_group_id(0);
-    int r1 = get_group_id(1);
-    int im = get_group_id(2);
-    int first_row = (r0 * N_SIMDGROUP + get_sub_group_id()) * N_DST;
-
-    int i12 = im%ne12;
-    int i13 = im/ne12;
-
-    int offset_src0 = (first_row*nb01 + (i12/r2)*nb02 + (i13/r3)*nb03)/BLOCK_Q4K_SIZE;
-    uint blk = nb01 / BLOCK_Q4K_SIZE;
-    global uchar * blk_q     = (global uchar *)src0_q  + offset_src0*(QK_K/2);
-    global uchar * blk_s     = (global uchar *)src0_s  + offset_src0*K_SCALE_SIZE;
-    global half  * blk_d     = (global half  *)src0_d  + offset_src0;
-    global half  * blk_dm    = (global half  *)src0_dm + offset_src0;
-
-    int offset_src1 = r1*nb11 + (i12)*nb12 + (i13)*nb13;
-    global float * y = (global float *)(src1 + offset_src1);
-
-    float yl[16];
-    float yh[16];
-    float sumf[N_DST] = {0.f};
-    float all_sum;
-
-    global float * y4 = y + ix * QK_K + 64 * iq + 8 * ir;
-
-    ushort  sc16[4];
-    uchar * sc8 = (uchar *)sc16;
-
-    for (int ib = ix; ib < nb; ib += BLOCK_STRIDE) {
-        float4 sumy = {0.f, 0.f, 0.f, 0.f};
-        for (int i = 0; i < 8; ++i) {
-            yl[i+0] = y4[i+0];
-            sumy.s0 += yl[i+0];
-
-            yl[i+8] = y4[i+32];
-            sumy.s1 += yl[i+8];
-
-            yh[i+0] = y4[i+128];
-            sumy.s2 += yh[i+0];
-
-            yh[i+8] = y4[i+160];
-            sumy.s3 += yh[i+8];
-        }
-
-        global ushort * q1 = (global ushort *)(blk_q + ib * (QK_K/2)) + (16 * iq + 4 * ir);
-        global ushort * sc = (global ushort *)(blk_s + ib * K_SCALE_SIZE) + iq;
-        global half   * d  = blk_d + ib;
-        global half   * dm = blk_dm + ib;
-
-        for (int row = 0; row < N_DST; row++) {
-            sc16[0] = sc[0] & kmask1;
-            sc16[1] = sc[2] & kmask1;
-            sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
-            sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
-
-            global ushort * q2 = q1 + 32;
-
-            float4 acc1 = {0.f, 0.f, 0.f, 0.f};
-            float4 acc2 = {0.f, 0.f, 0.f, 0.f};
-            for (int i = 0; i < 8; i += 2) {
-                acc1.s0 += yl[i+0] * (q1[i/2] & 0x000F);
-                acc1.s1 += yl[i+1] * (q1[i/2] & 0x0F00);
-                acc1.s2 += yl[i+8] * (q1[i/2] & 0x00F0);
-                acc1.s3 += yl[i+9] * (q1[i/2] & 0xF000);
-                acc2.s0 += yh[i+0] * (q2[i/2] & 0x000F);
-                acc2.s1 += yh[i+1] * (q2[i/2] & 0x0F00);
-                acc2.s2 += yh[i+8] * (q2[i/2] & 0x00F0);
-                acc2.s3 += yh[i+9] * (q2[i/2] & 0xF000);
-            }
-
-            float dall = *d;
-            float dmin = *dm;
-            sumf[row] += dall * ((acc1.s0 + 1.f/256.f * acc1.s1) * sc8[0] +
-                                 (acc1.s2 + 1.f/256.f * acc1.s3) * sc8[1] * 1.f/16.f +
-                                 (acc2.s0 + 1.f/256.f * acc2.s1) * sc8[4] +
-                                 (acc2.s2 + 1.f/256.f * acc2.s3) * sc8[5] * 1.f/16.f) -
-                         dmin * (sumy.s0 * sc8[2] + sumy.s1 * sc8[3] + sumy.s2 * sc8[6] + sumy.s3 * sc8[7]);
-
-            q1 += blk*64;
-            sc += blk*6;
-            d  += blk;
-            dm += blk;
-        }
-
-        y4 += BLOCK_STRIDE * QK_K;
-    }
-
-    global float * dst_f32 = (global float *) dst + im*ne0*ne1 + r1*ne0;
-
-    for (int row = 0; row < N_DST; ++row) {
-        all_sum = sub_group_reduce_add(sumf[row]);
-        if (first_row + row < ne01) {
-            if (get_sub_group_local_id() == 0) {
-                dst_f32[first_row + row] = all_sum;
-            }
-        }
-    }
-}
-
-#endif // !NVIDIA_GPU
-
-// NVIDIA OpenCL does not expose cl_khr_subgroups as a compile-time extension
-// macro, so we skip the #pragma here and use __local tree-reduction instead.
-
 // SOA flat kernel for Q4_K x f32 matrix-vector multiply.
-// NVIDIA only: N_SIMDWIDTH=32 (warp), BLOCK_STRIDE=2, __local tree-reduction.
+//
+// GPU-specific parameters:
+//   NVIDIA  : N_SIMDWIDTH=32,  BLOCK_STRIDE=2,  __local tree-reduction
+//   Adreno  : N_SIMDWIDTH=64,  BLOCK_STRIDE=4,  sub_group_reduce_add
 //
 // Q4_K qs byte layout (SOA, 128 bytes per super-block = QK_K/2):
 //   qs[ 0..31]: lo nibble = element   0..31  (sg=0),  hi nibble = element  32..63  (sg=1)
@@ -227,12 +49,23 @@ kernel void kernel_mul_mv_q4_K_f32_flat(
 #define QK_K         256
 #define K_SCALE_SIZE 12
 #define N_DST        4
+#define N_SIMDGROUP  1
 
+#ifdef INTEL_GPU
+#define N_SIMDWIDTH 16
+#elif defined(ADRENO_GPU)
+#define N_SIMDWIDTH 64
+#else
+// NVIDIA: cl_khr_subgroups not exposed as compile-time macro; use __local tree-reduction
 #define N_SIMDWIDTH 32
+#endif
 
 // 16 threads collaborate on one super-block, BLOCK_STRIDE super-blocks per iteration
 #define BLOCK_STRIDE (N_SIMDWIDTH/16)
 
+#ifdef ADRENO_GPU
+REQD_SUBGROUP_SIZE_64
+#endif
 kernel void kernel_mul_mv_q4_K_f32_flat(
     global uchar * src0_qs,
     global uchar * src0_scales,
@@ -395,7 +228,22 @@ kernel void kernel_mul_mv_q4_K_f32_flat(
 
     global float * dst_f32 = (global float *)dst + (ulong)im*ne0*ne1 + (ulong)r1*ne0;
 
-    // NVIDIA: cl_khr_subgroups is not exposed as a compile-time extension macro,
+#ifdef ADRENO_GPU
+    // Adreno: sub_group_reduce_add across the 64-wide wavefront.
+    float4 result = (float4)(
+        sub_group_reduce_add(sumf.s0),
+        sub_group_reduce_add(sumf.s1),
+        sub_group_reduce_add(sumf.s2),
+        sub_group_reduce_add(sumf.s3)
+    );
+    if (get_sub_group_local_id() == 0) {
+        if (first_row + 0 < ne01) dst_f32[first_row + 0] = result.s0;
+        if (first_row + 1 < ne01) dst_f32[first_row + 1] = result.s1;
+        if (first_row + 2 < ne01) dst_f32[first_row + 2] = result.s2;
+        if (first_row + 3 < ne01) dst_f32[first_row + 3] = result.s3;
+    }
+#else
+    // NVIDIA: cl_khr_subgroups not exposed as compile-time macro,
     // so use __local tree-reduction instead of sub_group_reduce_add.
     __local float4 lm[N_SIMDWIDTH];
     lm[lid] = sumf;
@@ -410,4 +258,5 @@ kernel void kernel_mul_mv_q4_K_f32_flat(
         if (first_row + 2 < ne01) dst_f32[first_row + 2] = lm[0].s2;
         if (first_row + 3 < ne01) dst_f32[first_row + 3] = lm[0].s3;
     }
+#endif
 }
