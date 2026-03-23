@@ -390,6 +390,8 @@ struct ggml_backend_opencl_context {
     std::string driver_version;
 
     GPU_FAMILY gpu_family;
+    bool use_adreno_kernels;
+    bool use_no_subgroups_compat;
     ADRENO_GPU_GEN adreno_gen;
 
     cl_int alignment;
@@ -791,6 +793,11 @@ struct ggml_backend_opencl_context {
 // All registered devices with a default device in the front.
 static std::vector<ggml_backend_device> g_ggml_backend_opencl_devices;
 
+static bool ggml_opencl_uses_local_subgroup_compat(const ggml_backend_opencl_context * backend_ctx) {
+    return backend_ctx->use_no_subgroups_compat ||
+           backend_ctx->device_name.find("NVIDIA") != std::string::npos;
+}
+
 inline std::string read_file(const std::string &path) {
   std::ifstream ifs(path);
   if (!ifs) {
@@ -817,9 +824,12 @@ static cl_program build_program_from_source(cl_context ctx, cl_device_id dev, co
     std::string device_name(device_name_size, '\0');
     CL_CHECK(clGetDeviceInfo(dev, CL_DEVICE_NAME, device_name_size, device_name.data(), nullptr));
 
-    if (device_name.find("NVIDIA") != std::string::npos) {
-        static const char * nvidia_compat_prelude =
-            "// Experimental NVIDIA OpenCL compatibility prelude\n"
+    const bool use_no_subgroups_compat =
+        compile_opts.find("GGML_OPENCL_NO_SUBGROUPS_COMPAT=1") != std::string::npos;
+
+    if (device_name.find("NVIDIA") != std::string::npos || use_no_subgroups_compat) {
+        static const char * subgroup_compat_prelude =
+            "// Experimental OpenCL no-subgroups compatibility prelude\n"
             "#define NVIDIA_GPU 1\n"
             "#ifndef INTEL_GPU\n"
             "#define INTEL_GPU 1\n"
@@ -864,11 +874,17 @@ static cl_program build_program_from_source(cl_context ctx, cl_device_id dev, co
             "#ifndef sub_group_reduce_max\n"
             "#define sub_group_reduce_max(x) (x)\n"
             "#endif\n"
+            "#ifndef sub_group_scan_inclusive_add\n"
+            "#define sub_group_scan_inclusive_add(x) (x)\n"
+            "#endif\n"
+            "#ifndef sub_group_scan_exclusive_add\n"
+            "#define sub_group_scan_exclusive_add(x) (0)\n"
+            "#endif\n"
             "#ifndef sub_group_broadcast\n"
             "#define sub_group_broadcast(x, lane) (x)\n"
             "#endif\n";
 
-        source.insert(0, nvidia_compat_prelude);
+        source.insert(0, subgroup_compat_prelude);
     }
 
     program_size = source.size();
@@ -896,7 +912,7 @@ static cl_program build_program_from_source(cl_context ctx, cl_device_id dev, co
 
 static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_version opencl_c_version) {
     cl_int err;
-    const bool experimental_nvidia = backend_ctx->device_name.find("NVIDIA") != std::string::npos;
+    const bool use_local_subgroup_compat = ggml_opencl_uses_local_subgroup_compat(backend_ctx);
 
     // compiler options for general kernels
     auto opencl_c_std =
@@ -908,6 +924,11 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
 
     if (backend_ctx->adreno_use_large_buffer) {
         compile_opts += " -qcom-enable-large-buffer ";
+    }
+    if (backend_ctx->use_no_subgroups_compat) {
+        compile_opts += " -DGGML_OPENCL_NO_SUBGROUPS_COMPAT=1";
+        GGML_LOG_WARN("ggml_opencl: building kernels with no-subgroups compatibility mode for '%s'\n",
+            backend_ctx->device_name.c_str());
     }
 
     GGML_LOG_INFO("ggml_opencl: loading OpenCL kernels");
@@ -1042,7 +1063,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
         CL_CHECK((backend_ctx->kernel_convert_block_q5_0  = clCreateKernel(backend_ctx->program_cvt, "kernel_convert_block_q5_0", &err), err));
         CL_CHECK((backend_ctx->kernel_restore_block_q5_0  = clCreateKernel(backend_ctx->program_cvt, "kernel_restore_block_q5_0", &err), err));
         CL_CHECK((backend_ctx->kernel_convert_block_mxfp4 = clCreateKernel(backend_ctx->program_cvt, "kernel_convert_block_mxfp4", &err), err));
-        if (!experimental_nvidia) {
+        if (!use_local_subgroup_compat) {
             CL_CHECK((backend_ctx->kernel_convert_block_mxfp4_trans = clCreateKernel(backend_ctx->program_cvt, "kernel_convert_block_mxfp4_trans", &err), err));
             CL_CHECK((backend_ctx->kernel_restore_block_mxfp4_trans = clCreateKernel(backend_ctx->program_cvt, "kernel_restore_block_mxfp4_trans", &err), err));
         }
@@ -1707,7 +1728,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
 
     // mul_mm_f16_f32_kq_kqv
     {
-        if (!experimental_nvidia) {
+        if (!use_local_subgroup_compat) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
             const std::string kernel_src {
                 #include "mul_mm_f16_f32_kq_kqv.cl.h"
@@ -2432,7 +2453,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
                 const std::string kernel_src = read_file("conv2d.cl");
                 const std::string kernel_src_f16_f32 = read_file("conv2d_f16_f32.cl");
         #endif
-                if (!experimental_nvidia && !kernel_src.empty()) {
+                if (!use_local_subgroup_compat && !kernel_src.empty()) {
                     backend_ctx->program_conv_2d_f16 =
                         build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), (std::string(compile_opts) + " -DUSE_FP16=1").c_str());
                     CL_CHECK((backend_ctx->kernel_conv_2d_f16 = clCreateKernel(backend_ctx->program_conv_2d_f16, "kernel_conv_2d", &err), err));
@@ -2448,7 +2469,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
                     backend_ctx->program_conv_2d_f32 = nullptr;
                     backend_ctx->kernel_conv_2d_f32 = nullptr;
                 }
-                if (!experimental_nvidia && !kernel_src_f16_f32.empty()) {
+                if (!use_local_subgroup_compat && !kernel_src_f16_f32.empty()) {
                     backend_ctx->program_conv_2d_f16_f32 =
                         build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src_f16_f32.c_str(), compile_opts);
                     CL_CHECK((backend_ctx->kernel_conv_2d_f16_f32 = clCreateKernel(backend_ctx->program_conv_2d_f16_f32, "kernel_conv_2d", &err), err));
@@ -2560,6 +2581,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
 
     // Adreno kernels
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+    if (backend_ctx->use_adreno_kernels) {
     // transpose
     {
 #ifdef GGML_OPENCL_EMBED_KERNELS
@@ -2821,7 +2843,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
 
     // gemv_moe_mxfp4_f32
     {
-        if (!experimental_nvidia) {
+        if (!use_local_subgroup_compat) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
             const std::string kernel_src {
                 #include "gemv_moe_mxfp4_f32.cl.h"
@@ -2839,7 +2861,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
 
     // gemm_moe_mxfp4_f32
     {
-        if (!experimental_nvidia) {
+        if (!use_local_subgroup_compat) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
             const std::string kernel_src {
                 #include "gemm_moe_mxfp4_f32.cl.h"
@@ -3153,6 +3175,8 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
     auto backend_ctx        = std::make_unique<ggml_backend_opencl_context>();
     backend_ctx->device     = dev_ctx->device;
     backend_ctx->gpu_family = GPU_FAMILY::UNKNOWN;
+    backend_ctx->use_adreno_kernels = false;
+    backend_ctx->use_no_subgroups_compat = false;
 
     // ref_count get increased in ggml_backend_opencl_device_init
     // This function is also used to retrieve backend context, so we don't want
@@ -3164,6 +3188,7 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
         strstr(dev_ctx->device_name.c_str(), "Qualcomm") ||
         strstr(dev_ctx->device_version.c_str(), "Adreno")) {
         backend_ctx->gpu_family = GPU_FAMILY::ADRENO;
+        backend_ctx->use_adreno_kernels = true;
         // Usually device version contains the detailed device name
         backend_ctx->adreno_gen = get_adreno_gpu_gen(dev_ctx->device_version.c_str());
         if (backend_ctx->adreno_gen == ADRENO_GPU_GEN::ADRENO_UNKNOWN) {
@@ -3173,6 +3198,11 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
         // Use wave size of 64 for all Adreno GPUs.
         backend_ctx->adreno_wave_size = 64;
     } else if (strstr(dev_ctx->device_name.c_str(), "Intel")) {
+        backend_ctx->gpu_family = GPU_FAMILY::INTEL;
+    } else if (strstr(dev_ctx->device_name.c_str(), "Apple") ||
+               strstr(dev_ctx->platform_name.c_str(), "Apple")) {
+        GGML_LOG_WARN("ggml_opencl: treating Apple device '%s' as generic OpenCL/Intel-like for experimental support\n",
+            dev_ctx->device_name.c_str());
         backend_ctx->gpu_family = GPU_FAMILY::INTEL;
     } else if (strstr(dev_ctx->device_name.c_str(), "NVIDIA") ||
                strstr(dev_ctx->platform_name.c_str(), "NVIDIA")) {
@@ -3188,10 +3218,9 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
     }
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
-    if (backend_ctx->gpu_family != GPU_FAMILY::ADRENO) {
-        GGML_LOG_ERROR("ggml_opencl: Adreno-specific kernels should not be enabled for non-Adreno GPUs; "
-            "run on an Adreno GPU or recompile with CMake option `-DGGML_OPENCL_USE_ADRENO_KERNELS=OFF`\n");
-        return nullptr;
+    if (!backend_ctx->use_adreno_kernels) {
+        GGML_LOG_WARN("ggml_opencl: Adreno-specific kernels are compiled in but disabled for non-Adreno device '%s'\n",
+            dev_ctx->device_name.c_str());
     }
 #endif
 
@@ -3203,11 +3232,22 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
 
     ggml_cl_version platform_version = get_opencl_platform_version(dev_ctx->platform);
 
-    // Check device OpenCL version, OpenCL 2.0 or above is required
+    const bool experimental_apple =
+        strstr(dev_ctx->device_name.c_str(), "Apple") ||
+        strstr(dev_ctx->platform_name.c_str(), "Apple");
+
+    // Check device OpenCL version. OpenCL 1.2 runtimes can still work through
+    // the experimental no-subgroups compatibility path on non-Adreno devices.
     ggml_cl_version opencl_c_version = get_opencl_c_version(platform_version, device);
     if (opencl_c_version.major < 2) {
-        GGML_LOG_ERROR("ggml_opencl: OpenCL 2.0 or above is required\n");
-        return nullptr;
+        if (!backend_ctx->use_adreno_kernels &&
+            opencl_c_version.major == 1 && opencl_c_version.minor >= 2) {
+            GGML_LOG_WARN("ggml_opencl: allowing experimental OpenCL %d.%d runtime for '%s'\n",
+                opencl_c_version.major, opencl_c_version.minor, dev_ctx->device_name.c_str());
+        } else {
+            GGML_LOG_ERROR("ggml_opencl: OpenCL 2.0 or above is required\n");
+            return nullptr;
+        }
     }
 
     // Check driver version
@@ -3233,6 +3273,9 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
     ext_buffer[ext_str_size] = '\0'; // ensure it is null terminated
     // Check if ext_buffer contains cl_khr_fp16
     backend_ctx->fp16_support = strstr(ext_buffer, "cl_khr_fp16") != NULL;
+    const bool has_subgroups =
+        strstr(ext_buffer, "cl_khr_subgroups") != NULL ||
+        strstr(ext_buffer, "cl_intel_subgroups") != NULL;
     GGML_LOG_INFO("ggml_opencl: device FP16 support: %s\n", backend_ctx->fp16_support ? "true" : "false");
     // check Adreno large buffer support
     backend_ctx->adreno_has_large_buffer = strstr(ext_buffer, "cl_qcom_large_buffer") != NULL;
@@ -3241,7 +3284,8 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
     // even though the hardware can execute half operations. Allow continuing
     // so we can see whether kernel compilation/runtime succeeds in practice.
     if (!backend_ctx->fp16_support) {
-        if (strstr(dev_ctx->device_name.c_str(), "NVIDIA") ||
+        if (experimental_apple ||
+            strstr(dev_ctx->device_name.c_str(), "NVIDIA") ||
             strstr(dev_ctx->platform_name.c_str(), "NVIDIA")) {
             GGML_LOG_WARN("ggml_opencl: FP16 extension not reported for '%s'; continuing experimentally\n",
                 dev_ctx->device_name.c_str());
@@ -3251,12 +3295,19 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
         }
     }
 
+    backend_ctx->use_no_subgroups_compat =
+        !backend_ctx->use_adreno_kernels &&
+        ((opencl_c_version.major == 1 && opencl_c_version.minor >= 2) ||
+         (opencl_c_version.major == 3 && !has_subgroups));
+    if (backend_ctx->use_no_subgroups_compat) {
+        GGML_LOG_WARN("ggml_opencl: enabling no-subgroups compatibility mode for '%s'\n",
+            dev_ctx->device_name.c_str());
+    }
+
     // If OpenCL 3.0 is supported, then check for cl_khr_subgroups, which becomes
     // optional in OpenCL 3.0 (cl_khr_subgroup is mandatory in OpenCL 2.x)
-    if (opencl_c_version.major == 3 && strstr(ext_buffer, "cl_khr_subgroups") == NULL &&
-        strstr(ext_buffer, "cl_intel_subgroups") == NULL) {
-        if (strstr(dev_ctx->device_name.c_str(), "NVIDIA") ||
-            strstr(dev_ctx->platform_name.c_str(), "NVIDIA")) {
+    if (opencl_c_version.major == 3 && !has_subgroups) {
+        if (backend_ctx->use_no_subgroups_compat) {
             GGML_LOG_WARN("ggml_opencl: subgroup extensions not reported for '%s'; continuing experimentally\n",
                 dev_ctx->device_name.c_str());
         } else {
@@ -3282,16 +3333,21 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
     GGML_LOG_INFO("ggml_opencl: device max workgroup size: %lu\n", backend_ctx->max_workgroup_size);
 
     // Check SVM.
-    cl_device_svm_capabilities svm_caps;
-    CL_CHECK(clGetDeviceInfo(device, CL_DEVICE_SVM_CAPABILITIES, sizeof(cl_device_svm_capabilities), &svm_caps, 0));
-    GGML_LOG_INFO("ggml_opencl: SVM coarse grain buffer support: %s\n",
-        svm_caps & CL_DEVICE_SVM_COARSE_GRAIN_BUFFER ? "true" : "false");
-    GGML_LOG_INFO("ggml_opencl: SVM fine grain buffer support: %s\n",
-        svm_caps & CL_DEVICE_SVM_FINE_GRAIN_BUFFER ? "true" : "false");
-    GGML_LOG_INFO("ggml_opencl: SVM fine grain system support: %s\n",
-        svm_caps & CL_DEVICE_SVM_FINE_GRAIN_SYSTEM ? "true" : "false");
-    GGML_LOG_INFO("ggml_opencl: SVM atomics support: %s\n",
-        svm_caps & CL_DEVICE_SVM_ATOMICS ? "true" : "false");
+    if (opencl_c_version.major >= 2) {
+        cl_device_svm_capabilities svm_caps;
+        CL_CHECK(clGetDeviceInfo(device, CL_DEVICE_SVM_CAPABILITIES, sizeof(cl_device_svm_capabilities), &svm_caps, 0));
+        GGML_LOG_INFO("ggml_opencl: SVM coarse grain buffer support: %s\n",
+            svm_caps & CL_DEVICE_SVM_COARSE_GRAIN_BUFFER ? "true" : "false");
+        GGML_LOG_INFO("ggml_opencl: SVM fine grain buffer support: %s\n",
+            svm_caps & CL_DEVICE_SVM_FINE_GRAIN_BUFFER ? "true" : "false");
+        GGML_LOG_INFO("ggml_opencl: SVM fine grain system support: %s\n",
+            svm_caps & CL_DEVICE_SVM_FINE_GRAIN_SYSTEM ? "true" : "false");
+        GGML_LOG_INFO("ggml_opencl: SVM atomics support: %s\n",
+            svm_caps & CL_DEVICE_SVM_ATOMICS ? "true" : "false");
+    } else {
+        GGML_LOG_INFO("ggml_opencl: SVM support unavailable on OpenCL %d.%d runtime\n",
+            opencl_c_version.major, opencl_c_version.minor);
+    }
 
     if (opencl_c_version.major >= 3) {
         // Assume it is not available for 3.0, since it is optional in 3.0.
@@ -3301,10 +3357,11 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
         CL_CHECK(clGetDeviceInfo(device, CL_DEVICE_NON_UNIFORM_WORK_GROUP_SUPPORT, sizeof(cl_bool),
                                  &backend_ctx->non_uniform_workgroups, 0));
 #endif
-    } else {
-        GGML_ASSERT(opencl_c_version.major == 2);
+    } else if (opencl_c_version.major == 2) {
         // Non-uniform workgroup sizes is mandatory feature in v2.x.
         backend_ctx->non_uniform_workgroups = true;
+    } else {
+        backend_ctx->non_uniform_workgroups = false;
     }
 
     // Print out configurations
@@ -3313,7 +3370,9 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
 #endif // GGML_OPENCL_SOA_Q
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
-    GGML_LOG_INFO("ggml_opencl: using kernels optimized for Adreno (GGML_OPENCL_USE_ADRENO_KERNELS)\n");
+    if (backend_ctx->use_adreno_kernels) {
+        GGML_LOG_INFO("ggml_opencl: using kernels optimized for Adreno (GGML_OPENCL_USE_ADRENO_KERNELS)\n");
+    }
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
 
     // determine whether to use large buffer for Adreno
@@ -3343,31 +3402,33 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
     load_cl_kernels(backend_ctx.get(), opencl_c_version);
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
-    // Allocate intermediate buffers and images
-    size_t required_A_q_d_bytes = 311164928;
-    size_t required_A_s_d_bytes = 38895616;
-    size_t required_B_d_bytes = 45088768;
+    if (backend_ctx->use_adreno_kernels) {
+        // Allocate intermediate buffers and images
+        size_t required_A_q_d_bytes = 311164928;
+        size_t required_A_s_d_bytes = 38895616;
+        size_t required_B_d_bytes = 45088768;
 
-    // Ensure buffer sizes do not exceed the maximum allocation size
-    size_t max_A_q_d_bytes = MIN(required_A_q_d_bytes, backend_ctx->max_alloc_size);
-    size_t max_A_s_d_bytes = MIN(required_A_s_d_bytes, backend_ctx->max_alloc_size);
-    size_t max_B_d_bytes   = MIN(required_B_d_bytes, backend_ctx->max_alloc_size);
-    if (required_A_q_d_bytes > backend_ctx->max_alloc_size) {
-        GGML_LOG_WARN("ggml_opencl: A_q_d buffer size reduced from %zu to %zu due to device limitations.\n",
-                      required_A_q_d_bytes, max_A_q_d_bytes);
-    }
-    if (required_A_s_d_bytes > backend_ctx->max_alloc_size) {
-        GGML_LOG_WARN("ggml_opencl: A_s_d buffer size reduced from %zu to %zu due to device limitations.\n",
-                      required_A_s_d_bytes, max_A_s_d_bytes);
-    }
-    if (required_B_d_bytes > backend_ctx->max_alloc_size) {
-        GGML_LOG_WARN("ggml_opencl: B_d buffer size reduced from %zu to %zu due to device limitations.\n",
-                      required_B_d_bytes, max_B_d_bytes);
-    }
+        // Ensure buffer sizes do not exceed the maximum allocation size
+        size_t max_A_q_d_bytes = MIN(required_A_q_d_bytes, backend_ctx->max_alloc_size);
+        size_t max_A_s_d_bytes = MIN(required_A_s_d_bytes, backend_ctx->max_alloc_size);
+        size_t max_B_d_bytes   = MIN(required_B_d_bytes, backend_ctx->max_alloc_size);
+        if (required_A_q_d_bytes > backend_ctx->max_alloc_size) {
+            GGML_LOG_WARN("ggml_opencl: A_q_d buffer size reduced from %zu to %zu due to device limitations.\n",
+                          required_A_q_d_bytes, max_A_q_d_bytes);
+        }
+        if (required_A_s_d_bytes > backend_ctx->max_alloc_size) {
+            GGML_LOG_WARN("ggml_opencl: A_s_d buffer size reduced from %zu to %zu due to device limitations.\n",
+                          required_A_s_d_bytes, max_A_s_d_bytes);
+        }
+        if (required_B_d_bytes > backend_ctx->max_alloc_size) {
+            GGML_LOG_WARN("ggml_opencl: B_d buffer size reduced from %zu to %zu due to device limitations.\n",
+                          required_B_d_bytes, max_B_d_bytes);
+        }
 
-    backend_ctx->prealloc_quant_trans.allocate(context, max_A_q_d_bytes);
-    backend_ctx->prealloc_scales_trans.allocate(context, max_A_s_d_bytes);
-    backend_ctx->prealloc_act_trans.allocate(context, max_B_d_bytes);
+        backend_ctx->prealloc_quant_trans.allocate(context, max_A_q_d_bytes);
+        backend_ctx->prealloc_scales_trans.allocate(context, max_A_s_d_bytes);
+        backend_ctx->prealloc_act_trans.allocate(context, max_B_d_bytes);
+    }
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
 
     backend_ctx->disable_fusion = getenv("GGML_OPENCL_DISABLE_FUSION") != nullptr;
@@ -4653,6 +4714,10 @@ static enum ggml_status ggml_backend_opencl_buffer_init_tensor(ggml_backend_buff
 // The optimized gemm and gemv kernels are used for large matrices without batch.
 // tensor is the quantized weights matrix.
 inline bool use_adreno_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
+    if (!backend_ctx->use_adreno_kernels) {
+        return false;
+    }
+
     int64_t threshold_ne0 = 512;
     int64_t threshold_ne1 = 512;
     if (!backend_ctx->adreno_cl_compiler_version.newer_than_or_same(E031, 38, 11, 0) &&
@@ -4665,7 +4730,10 @@ inline bool use_adreno_kernels(const ggml_backend_opencl_context *backend_ctx, c
 }
 
 inline bool use_adreno_moe_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
-    GGML_UNUSED(backend_ctx);
+    if (!backend_ctx->use_adreno_kernels) {
+        return false;
+    }
+
     int ne01 = tensor->ne[1];
     return ((strstr(tensor->name, "ffn") != NULL) || (strstr(tensor->name, "as") != NULL)) && (ne01 % 64 == 0);
 }
@@ -6031,7 +6099,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
         return;
     }
     if (tensor->type == GGML_TYPE_Q4_K &&
-        backend_ctx->device_name.find("NVIDIA") != std::string::npos) {
+        ggml_opencl_uses_local_subgroup_compat(backend_ctx)) {
         ggml_tensor_extra_cl_q4_K * extra = (ggml_tensor_extra_cl_q4_K *)tensor->extra;
 
         cl_int err;
@@ -10930,6 +10998,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 
     // q4_1 x fp32 — Adreno-specific path; NVIDIA uses the flat kernel in the switch below
     if (src0t == GGML_TYPE_Q4_1 && src1t == GGML_TYPE_F32 &&
+        !backend_ctx->use_no_subgroups_compat &&
         backend_ctx->device_name.find("NVIDIA") == std::string::npos) {
             ggml_cl_mul_mat_q4_1_f32_adreno(backend, src0, src1, dst);
             return;
@@ -10956,6 +11025,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 
     // q4_0 x fp32 — Adreno-specific image path; NVIDIA uses the flat kernel in the switch below
     if(src0t == GGML_TYPE_Q4_0 && src1t == GGML_TYPE_F32 &&
+       !backend_ctx->use_no_subgroups_compat &&
        backend_ctx->device_name.find("NVIDIA") == std::string::npos) {
         // TODO: remove duplicate definitions of image description + format -- move to top
 
@@ -11604,6 +11674,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         src1t == GGML_TYPE_F32 &&
         ne00%32 == 0 &&
         ne11 > 2 &&
+        !backend_ctx->use_no_subgroups_compat &&
         backend_ctx->device_name.find("NVIDIA") == std::string::npos) {
 #ifdef GGML_OPENCL_SOA_Q
         // Set up kernel.
@@ -11723,10 +11794,10 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             }
 
             if (src1t == GGML_TYPE_F32) {
-                const bool experimental_nvidia = backend_ctx->device_name.find("NVIDIA") != std::string::npos;
+                const bool use_local_subgroup_compat = ggml_opencl_uses_local_subgroup_compat(backend_ctx);
                 if (ne11 * ne12 < 4) {
                     kernel = backend_ctx->kernel_mul_mat_f16_f32_1row;
-                } else if (experimental_nvidia) {
+                } else if (use_local_subgroup_compat) {
                     kernel = backend_ctx->kernel_mul_mat_f16_f32;
                     nrows = 4;
                 } else if (ne00 >= 128 && ne01 >= 8 && ne00%4 == 0) {
@@ -11774,7 +11845,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 #ifdef GGML_OPENCL_SOA_Q
             kernel = backend_ctx->kernel_mul_mat_q4_0_f32_8x_flat;
             ndst = 8;
-            if (backend_ctx->device_name.find("NVIDIA") != std::string::npos) {
+            if (ggml_opencl_uses_local_subgroup_compat(backend_ctx)) {
                 nth0 = 32; // one warp; __local float8 tree-reduction inside kernel
                 nth1 = 1;
             } else if (backend_ctx->gpu_family == INTEL) {
@@ -11844,7 +11915,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 #ifdef GGML_OPENCL_SOA_Q
             kernel = backend_ctx->kernel_mul_mv_q4_1_f32_flat;
             ndst = 4;
-            if (backend_ctx->device_name.find("NVIDIA") != std::string::npos) {
+            if (ggml_opencl_uses_local_subgroup_compat(backend_ctx)) {
                 nth0 = 32; // one warp; __local float4 tree-reduction inside kernel
                 nth1 = 1;
             } else if (backend_ctx->gpu_family == INTEL) {
@@ -11947,7 +12018,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             // nth0 - subgroup size
             // nth1 - number of subgroups per workgroup
             // ndst - number of output values per workgroup = output per subgroup * number of subgroups
-            if (backend_ctx->device_name.find("NVIDIA") != std::string::npos) {
+            if (ggml_opencl_uses_local_subgroup_compat(backend_ctx)) {
                 nth0 = 32; // N_SIMDWIDTH (warp size)
                 nth1 = 1;  // N_SG_Q8_0
                 ndst = 4;  // N_R0_Q8_0
@@ -12026,7 +12097,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         case GGML_TYPE_Q3_K:
         case GGML_TYPE_Q4_K: {
 #ifdef GGML_OPENCL_SOA_Q
-            if (src0t == GGML_TYPE_Q4_K && backend_ctx->device_name.find("NVIDIA") != std::string::npos) {
+            if (src0t == GGML_TYPE_Q4_K && ggml_opencl_uses_local_subgroup_compat(backend_ctx)) {
                 kernel = backend_ctx->kernel_mul_mv_q4_K_f32_flat;
                 nth0 = 32;  // one warp; __local tree-reduction
                 nth1 = 1;
@@ -12095,7 +12166,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 
             kernel = backend_ctx->kernel_mul_mv_q4_K_f32;
 
-            if (backend_ctx->device_name.find("NVIDIA") != std::string::npos) {
+            if (ggml_opencl_uses_local_subgroup_compat(backend_ctx)) {
                 nth0 = 32;
                 nth1 = 1;
                 ndst = 4;
@@ -12136,7 +12207,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         case GGML_TYPE_Q5_K:
         case GGML_TYPE_Q6_K:
 #ifdef GGML_OPENCL_SOA_Q
-            if (backend_ctx->device_name.find("NVIDIA") != std::string::npos) {
+            if (ggml_opencl_uses_local_subgroup_compat(backend_ctx)) {
                 kernel = backend_ctx->kernel_mul_mv_q6_K_f32_flat;
                 nth0 = 32; // one warp (32 lanes); __local tree-reduction inside kernel
                 nth1 = 1;  // N_SIMDGROUP=1 for NVIDIA (overridden in kernel source)
@@ -14013,7 +14084,8 @@ static void ggml_cl_glu(ggml_backend_t backend, const ggml_tensor * src0, const 
     }
 
     const size_t nrows = ggml_nrows(src0);
-    size_t nth = 512;
+    size_t nth = MIN((size_t)512, backend_ctx->max_workgroup_size);
+    nth = MAX((size_t)1, nth);
     size_t global_work_size[] = {nrows*nth, 1, 1};
     size_t local_work_size[] = {nth, 1, 1};
 
