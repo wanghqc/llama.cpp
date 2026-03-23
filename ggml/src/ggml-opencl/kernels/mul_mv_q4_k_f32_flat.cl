@@ -34,8 +34,15 @@
 //   qs[96..127]:lo nibble = element 192..223 (sg=6),  hi nibble = element 224..255 (sg=7)
 //
 // Thread mapping (16 threads per super-block):
-//   tid = lid / BLOCK_STRIDE  (0..15)   role within super-block
-//   ix  = lid % BLOCK_STRIDE  (0..BLOCK_STRIDE-1)  which super-block this thread handles
+//   ix  = lid / 16             (0..BLOCK_STRIDE-1)  which super-block this thread handles
+//   tid = lid % 16             (0..15)               role within super-block
+//
+// Grouping consecutive threads by super-block (ix = lid/16) instead of interleaving
+// (ix = lid%BLOCK_STRIDE) gives coalesced global memory access: all 16 threads in an
+// ix-group access qs at stride-8 byte offsets within the same 128-byte super-block,
+// covering the full block in 2 cache lines.  The interleaved layout (old ix = lid%4
+// for Adreno) caused 128-byte strides between consecutive threads, preventing coalescing.
+//
 //   ip  = tid / 8  (0..1)   first or second 64-byte qs section
 //   il  = tid % 8  (0..7)   8-byte segment within section
 //   sg_lo = 4*ip + 2*(il/4)   scale-group for lo nibbles (0,2,4,6)
@@ -110,8 +117,8 @@ kernel void kernel_mul_mv_q4_K_f32_flat(
                       + (ulong)(i13/r3) * ((ulong)nb * ne01 * ne02);
 
     int lid = get_local_id(0);
-    int tid = lid / BLOCK_STRIDE;  // 0..15: role within a super-block
-    int ix  = lid % BLOCK_STRIDE;  // 0..BLOCK_STRIDE-1: which super-block per iter
+    int ix  = lid / 16;            // 0..BLOCK_STRIDE-1: which super-block per iter
+    int tid = lid % 16;            // 0..15: role within a super-block
 
     int ip  = tid / 8;             // 0 or 1 (which 64-byte qs section)
     int il  = tid % 8;             // 0..7  (8-byte segment within section)

@@ -5439,13 +5439,15 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         backend_ctx->device_name.find("NVIDIA") != std::string::npos) {
         // Only convert full tensor writes (weight loading).  Partial writes
         // (e.g. KV-cache updates) bypass SOA and fall through to the pool write.
-        // NOTE: Adreno Q4_K flat kernel is currently disabled because:
-        //   1. It is slower than the packed kernel on Adreno (regression).
-        //   2. Allocating SOA buffers for all Q4_K tensors raises total GPU
-        //      memory usage enough to OOM the Q6_K SOA allocation that follows.
-        // When an Adreno-tuned flat Q4_K kernel is available, re-enable by
-        // adding `|| backend_ctx->gpu_family == ADRENO` to the condition above
-        // and verify with models that contain both Q4_K and Q6_K tensors.
+        //
+        // Adreno is intentionally excluded: profiling shows the flat kernel is
+        // ~30% slower than the packed kernel on Adreno (67 t/s vs 96 t/s on 1B
+        // Q4_K_M), because the packed kernel uses a divergence-free ushort-based
+        // scale decode whereas the flat kernel evaluates both branches of each
+        // ternary unconditionally.  Additionally, SOA buffers double the Q4_K
+        // GPU memory footprint, which causes OOM on 7B+ models that also have
+        // Q6_K tensors.  Re-enable (add || gpu_family == ADRENO) only after
+        // rewriting the scale decode to use the packed kernel's ushort approach.
         ggml_tensor_extra_cl * extra_orig = (ggml_tensor_extra_cl *)tensor->extra;
         GGML_ASSERT(extra_orig && "Tensors in OpenCL backend should have been allocated and initialized");
 
@@ -5462,43 +5464,42 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
 
         cl_int err;
 
-        if (backend_ctx->device_name.find("NVIDIA") != std::string::npos) {
-            // NVIDIA: GPU-side conversion via convert kernel.
-            // Uploads packed AoS data to a temporary buffer, runs the convert
-            // kernel to scatter into 4 SOA buffers, then releases the temp buffer.
-            cl_mem data_device = clCreateBuffer(context, CL_MEM_READ_WRITE,
-                ggml_nbytes(tensor), NULL, &err);
-            CL_CHECK(err);
-            CL_CHECK(clEnqueueWriteBuffer(queue, data_device, CL_TRUE, 0,
-                ggml_nbytes(tensor), data, 0, NULL, NULL));
+        // GPU-side AoS→SOA conversion via kernel_convert_block_q4_K.
+        // Works for all GPU families (NVIDIA, Adreno, Intel).
+        // Uploads packed AoS data to a temporary buffer, runs the convert
+        // kernel to scatter into 4 SOA buffers, then releases the temp buffer.
+        cl_mem data_device = clCreateBuffer(context, CL_MEM_READ_WRITE,
+            ggml_nbytes(tensor), NULL, &err);
+        CL_CHECK(err);
+        CL_CHECK(clEnqueueWriteBuffer(queue, data_device, CL_TRUE, 0,
+            ggml_nbytes(tensor), data, 0, NULL, NULL));
 
-            extra->qs     = clCreateBuffer(context, CL_MEM_READ_WRITE, size_qs,     NULL, &err); CL_CHECK(err);
-            extra->scales = clCreateBuffer(context, CL_MEM_READ_WRITE, size_scales, NULL, &err); CL_CHECK(err);
-            extra->d      = clCreateBuffer(context, CL_MEM_READ_WRITE, size_d,      NULL, &err); CL_CHECK(err);
-            extra->dmin   = clCreateBuffer(context, CL_MEM_READ_WRITE, size_dmin,   NULL, &err); CL_CHECK(err);
+        extra->qs     = clCreateBuffer(context, CL_MEM_READ_WRITE, size_qs,     NULL, &err); CL_CHECK(err);
+        extra->scales = clCreateBuffer(context, CL_MEM_READ_WRITE, size_scales, NULL, &err); CL_CHECK(err);
+        extra->d      = clCreateBuffer(context, CL_MEM_READ_WRITE, size_d,      NULL, &err); CL_CHECK(err);
+        extra->dmin   = clCreateBuffer(context, CL_MEM_READ_WRITE, size_dmin,   NULL, &err); CL_CHECK(err);
 
-            cl_kernel kernel = backend_ctx->kernel_convert_block_q4_K;
-            CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &data_device));
-            CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &extra->d));
-            CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &extra->dmin));
-            CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem), &extra->scales));
-            CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_mem), &extra->qs));
+        cl_kernel kernel = backend_ctx->kernel_convert_block_q4_K;
+        CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &data_device));
+        CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &extra->d));
+        CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &extra->dmin));
+        CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem), &extra->scales));
+        CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_mem), &extra->qs));
 
-            size_t gws[] = {n_blocks, 1, 1};
+        size_t gws[] = {n_blocks, 1, 1};
 
-            cl_event evt;
-            CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, gws, NULL, 0, NULL, &evt));
-            CL_CHECK(clWaitForEvents(1, &evt));
-            CL_CHECK(clReleaseMemObject(data_device));
+        cl_event evt;
+        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, gws, NULL, 0, NULL, &evt));
+        CL_CHECK(clWaitForEvents(1, &evt));
+        CL_CHECK(clReleaseMemObject(data_device));
 
-            extra->size_qs     = size_qs;
-            extra->size_scales = size_scales;
-            extra->size_d      = size_d;
-            extra->size_dmin   = size_dmin;
-            tensor->extra = extra;
-            ctx->soa_q4_K_tensors.insert(tensor);
-            return;
-        }
+        extra->size_qs     = size_qs;
+        extra->size_scales = size_scales;
+        extra->size_d      = size_d;
+        extra->size_dmin   = size_dmin;
+        tensor->extra = extra;
+        ctx->soa_q4_K_tensors.insert(tensor);
+        return;
     }
     if (tensor->type == GGML_TYPE_Q6_K) {
         ggml_tensor_extra_cl * extra_orig = (ggml_tensor_extra_cl *)tensor->extra;
@@ -6058,7 +6059,9 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
                 size, data, 0, NULL, NULL));
             CL_CHECK(clReleaseMemObject(data_device));
         } else {
-            // Adreno: CPU-side SOA→AoS restore — symmetric with set_tensor.
+            // Adreno (and any non-NVIDIA): CPU-side SOA→AoS restore.
+            // set_tensor uses the GPU convert kernel for all families;
+            // get_tensor restores on the CPU by reading the 4 SOA buffers.
             size_t n_blocks = (size_t)ggml_nelements(tensor) / ggml_blck_size(tensor->type);
             std::vector<uint8_t>  h_qs(extra->size_qs), h_scales(extra->size_scales);
             std::vector<uint16_t> h_d(n_blocks), h_dmin(n_blocks);
