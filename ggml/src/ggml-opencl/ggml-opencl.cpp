@@ -2619,6 +2619,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
                                        " -cl-mad-enable "
                                        " -DSIMDGROUP_WIDTH=" +
                                        std::to_string(backend_ctx->adreno_wave_size);
+        if (backend_ctx->use_no_subgroups_compat) {
+            CL_gemv_compile_opts += " -DGGML_OPENCL_NO_SUBGROUPS_COMPAT=1";
+        }
         if (backend_ctx->has_vector_subgroup_broadcast) {
             CL_gemv_compile_opts += " -DVECTOR_SUB_GROUP_BROADCAT ";
         }
@@ -2647,6 +2650,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
             " -DBLOCK_STRIDE_A=16384 "
             " -DSIMDGROUP_WIDTH=" +
             std::to_string(backend_ctx->adreno_wave_size);
+        if (backend_ctx->use_no_subgroups_compat) {
+            CL_gemv_compile_opts += " -DGGML_OPENCL_NO_SUBGROUPS_COMPAT=1";
+        }
         if (backend_ctx->has_vector_subgroup_broadcast) {
             CL_gemv_compile_opts += " -DVECTOR_SUB_GROUP_BROADCAT ";
         }
@@ -2671,6 +2677,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
             " -DBLOCK_STRIDE_A=16384 "
             " -DSIMDGROUP_WIDTH=" +
             std::to_string(backend_ctx->adreno_wave_size);
+        if (backend_ctx->use_no_subgroups_compat) {
+            CL_gemv_compile_opts += " -DGGML_OPENCL_NO_SUBGROUPS_COMPAT=1";
+        }
         if (backend_ctx->has_vector_subgroup_broadcast) {
             CL_gemv_compile_opts += " -DVECTOR_SUB_GROUP_BROADCAT ";
         }
@@ -2687,6 +2696,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
             " -DBLOCK_STRIDE_A=44032 "
             " -DSIMDGROUP_WIDTH=" +
             std::to_string(backend_ctx->adreno_wave_size);
+        if (backend_ctx->use_no_subgroups_compat) {
+            CL_gemv_compile_opts += " -DGGML_OPENCL_NO_SUBGROUPS_COMPAT=1";
+        }
         if (backend_ctx->has_vector_subgroup_broadcast) {
             CL_gemv_compile_opts += " -DVECTOR_SUB_GROUP_BROADCAT ";
         }
@@ -2703,6 +2715,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
             " -DBLOCK_STRIDE_A=128000 "
             " -DSIMDGROUP_WIDTH=" +
             std::to_string(backend_ctx->adreno_wave_size);
+        if (backend_ctx->use_no_subgroups_compat) {
+            CL_gemv_compile_opts += " -DGGML_OPENCL_NO_SUBGROUPS_COMPAT=1";
+        }
 
         if (backend_ctx->has_vector_subgroup_broadcast) {
             CL_gemv_compile_opts += " -DVECTOR_SUB_GROUP_BROADCAT ";
@@ -2747,6 +2762,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
     {
         std::string CL_gemv_compile_opts = std::string("-cl-std=") + opencl_c_std +
                                        " -cl-mad-enable ";
+        if (backend_ctx->use_no_subgroups_compat) {
+            CL_gemv_compile_opts += " -DGGML_OPENCL_NO_SUBGROUPS_COMPAT=1";
+        }
         if (backend_ctx->has_vector_subgroup_broadcast) {
             CL_gemv_compile_opts += " -DVECTOR_SUB_GROUP_BROADCAT ";
         }
@@ -2769,15 +2787,19 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
 
     // mul_mm_q8_0_f32_8x4
     {
+        if (backend_ctx->gpu_family == GPU_FAMILY::ADRENO) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
-        const std::string kernel_src_q8_8x4_gemm {
-            #include "mul_mm_q8_0_f32_8x4.cl.h"
-       };
+            const std::string kernel_src_q8_8x4_gemm {
+                #include "mul_mm_q8_0_f32_8x4.cl.h"
+           };
 #else
-        const std::string kernel_src_q8_8x4_gemm = read_file("mul_mm_q8_0_f32_8x4.cl");
+            const std::string kernel_src_q8_8x4_gemm = read_file("mul_mm_q8_0_f32_8x4.cl");
 #endif
-        backend_ctx->program_CL_gemm = build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src_q8_8x4_gemm.c_str(), compile_opts);
-        CL_CHECK((backend_ctx->kernel_mul_mm_q8_0_f32_8x4 = clCreateKernel(backend_ctx->program_CL_gemm, "kernel_mul_mm_q8_0_f32_8x4", &err), err));
+            backend_ctx->program_CL_gemm = build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src_q8_8x4_gemm.c_str(), compile_opts);
+            CL_CHECK((backend_ctx->kernel_mul_mm_q8_0_f32_8x4 = clCreateKernel(backend_ctx->program_CL_gemm, "kernel_mul_mm_q8_0_f32_8x4", &err), err));
+        } else {
+            backend_ctx->kernel_mul_mm_q8_0_f32_8x4 = nullptr;
+        }
         GGML_LOG_CONT(".");
     }
 
@@ -2787,6 +2809,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
                                        " -cl-mad-enable "
                                        " -DSIMDGROUP_WIDTH=" +
                                        std::to_string(backend_ctx->adreno_wave_size);
+        if (backend_ctx->use_no_subgroups_compat) {
+            CL_gemv_compile_opts += " -DGGML_OPENCL_NO_SUBGROUPS_COMPAT=1";
+        }
         if (backend_ctx->has_vector_subgroup_broadcast) {
             CL_gemv_compile_opts += " -DVECTOR_SUB_GROUP_BROADCAT ";
         }
@@ -2849,6 +2874,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
     std::string CL_moe_compile_opts = std::string("-cl-std=") + opencl_c_std +
             " -cl-mad-enable "
             " -cl-fast-relaxed-math";
+    if (backend_ctx->use_no_subgroups_compat) {
+        CL_moe_compile_opts += " -DGGML_OPENCL_NO_SUBGROUPS_COMPAT=1";
+    }
 
     // gemv_moe_mxfp4_f32
     {
@@ -14077,8 +14105,11 @@ static void ggml_cl_glu(ggml_backend_t backend, const ggml_tensor * src0, const 
     }
 
     const size_t nrows = ggml_nrows(src0);
-    size_t nth = MIN((size_t)512, backend_ctx->max_workgroup_size);
-    nth = MAX((size_t)1, nth);
+    const size_t kernel_max_workgroup_size = backend_ctx->get_kernel_workgroup_size(kernel);
+    size_t nth = MIN((size_t)512, (size_t)ne0);
+    nth = MIN(nth, kernel_max_workgroup_size);
+    nth = MIN(nth, backend_ctx->max_workgroup_size);
+    GGML_ASSERT(nth > 0);
     size_t global_work_size[] = {nrows*nth, 1, 1};
     size_t local_work_size[] = {nth, 1, 1};
 
