@@ -14,7 +14,11 @@
 #include "ggml-quants.h"
 #include "ggml.h"
 
+#ifdef __APPLE__
+#include <OpenCL/cl.h>
+#else
 #include <CL/cl.h>
+#endif
 
 #include <inttypes.h>
 #include <string.h>
@@ -57,6 +61,8 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
 struct ggml_backend_opencl_context;
 static cl_command_queue ggml_opencl_create_queue(ggml_backend_opencl_context * backend_ctx);
 static void ggml_cl_set_rows_quantized_host_fallback(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+static bool ggml_cl_can_mul_mat(const struct ggml_tensor * src0, const struct ggml_tensor * src1, struct ggml_tensor * dst);
+static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 
 // See https://gmplib.org/~tege/divcnst-pldi94.pdf figure 4.1.
 // Precompute mp (m' in the paper) and L such that division
@@ -184,7 +190,7 @@ static ggml_cl_version get_opencl_platform_version(cl_platform_id platform) {
 static ggml_cl_version get_opencl_c_version(ggml_cl_version platform_version, cl_device_id device) {
     size_t param_size;
 
-#if CL_TARGET_OPENCL_VERSION >= 300
+#if defined(CL_VERSION_3_0) && CL_TARGET_OPENCL_VERSION >= 300
     if (platform_version.major >= 3) {
         CL_CHECK(clGetDeviceInfo(device, CL_DEVICE_OPENCL_C_ALL_VERSIONS, 0, nullptr, &param_size));
         if (!param_size) {
@@ -204,7 +210,7 @@ static ggml_cl_version get_opencl_c_version(ggml_cl_version platform_version, cl
     }
 #else
     GGML_UNUSED(platform_version);
-#endif  // CL_TARGET_OPENCL_VERSION >= 300
+#endif  // defined(CL_VERSION_3_0) && CL_TARGET_OPENCL_VERSION >= 300
 
     CL_CHECK(clGetDeviceInfo(device, CL_DEVICE_OPENCL_C_VERSION, 0, nullptr, &param_size));
     if (!param_size) {
@@ -299,6 +305,7 @@ struct ggml_cl_buffer {
 struct ProfilingInfo {
     std::string op_name;
     std::string kernel_name;
+    std::string command_type;
 
     cl_kernel kernel;
     cl_event evt;
@@ -334,6 +341,7 @@ static void populateProfilingInfo(
     info.op_name     = tensor->name;
     info.kernel      = kernel;
     info.evt         = evt;
+    info.command_type = "kernel";
 
     // 0 means not specified, e.g., 2D workgroup, or NULL for driver to choose
     info.local_size[0] = 0;
@@ -358,6 +366,29 @@ static void populateProfilingInfo(
     info.output_size[1] = tensor->ne[1];
     info.output_size[2] = tensor->ne[2];
     info.output_size[3] = tensor->ne[3];
+}
+
+static void populateProfilingInfoCommand(
+        ProfilingInfo & info, cl_event evt, const char * command_name,
+        const ggml_tensor * tensor, size_t bytes) {
+    info.op_name = tensor ? tensor->name : "";
+    info.kernel_name = command_name ? command_name : "<command>";
+    info.command_type = "command";
+    info.kernel = nullptr;
+    info.evt = evt;
+
+    info.local_size[0] = 0;
+    info.local_size[1] = 0;
+    info.local_size[2] = 0;
+
+    info.global_size[0] = bytes;
+    info.global_size[1] = 0;
+    info.global_size[2] = 0;
+
+    info.output_size[0] = tensor ? tensor->ne[0] : bytes;
+    info.output_size[1] = tensor ? tensor->ne[1] : 0;
+    info.output_size[2] = tensor ? tensor->ne[2] : 0;
+    info.output_size[3] = tensor ? tensor->ne[3] : 0;
 }
 
 struct ggml_backend_opencl_context;
@@ -615,6 +646,12 @@ struct ggml_backend_opencl_context {
             return;
         }
 
+        double total_queued_ms   = 0.0;
+        double total_submit_ms   = 0.0;
+        double total_exec_ms     = 0.0;
+        double total_complete_ms = 0.0;
+        double total_end_to_end_ms = 0.0;
+
         // Populate profiling info
         for (ProfilingInfo & info : profiling_info) {
             cl_ulong cmd_queued;
@@ -632,14 +669,20 @@ struct ggml_backend_opencl_context {
                 info.evt, CL_PROFILING_COMMAND_START, sizeof(cl_ulong), &cmd_start, NULL));
             CL_CHECK(clGetEventProfilingInfo(
                 info.evt, CL_PROFILING_COMMAND_END, sizeof(cl_ulong), &cmd_end, NULL));
+        #ifdef CL_PROFILING_COMMAND_COMPLETE
             CL_CHECK(clGetEventProfilingInfo(
                 info.evt, CL_PROFILING_COMMAND_COMPLETE, sizeof(cl_ulong), &cmd_complete, NULL));
+        #else
+            cmd_complete = cmd_end;
+        #endif
             CL_CHECK(clReleaseEvent(info.evt));
 
-            char kernel_name[512];
-            CL_CHECK(clGetKernelInfo(info.kernel, CL_KERNEL_FUNCTION_NAME,
-                sizeof(kernel_name), kernel_name, NULL));
-            info.kernel_name = kernel_name;
+            if (info.kernel != nullptr) {
+                char kernel_name[512];
+                CL_CHECK(clGetKernelInfo(info.kernel, CL_KERNEL_FUNCTION_NAME,
+                    sizeof(kernel_name), kernel_name, NULL));
+                info.kernel_name = kernel_name;
+            }
 
             info.cmd_queued = cmd_queued;
             info.cmd_submit = cmd_submit;
@@ -651,19 +694,40 @@ struct ggml_backend_opencl_context {
             info.cmd_duration_ns            = cmd_end       - cmd_start;
             info.cmd_complete_duration_ns   = cmd_complete  - cmd_end;
             info.cmd_total_duration_ns      = cmd_complete  - cmd_queued;
+
+            total_queued_ms   += info.cmd_queued_duration_ns   / 1.e6;
+            total_submit_ms   += info.cmd_submit_duration_ns   / 1.e6;
+            total_exec_ms     += info.cmd_duration_ns          / 1.e6;
+            total_complete_ms += info.cmd_complete_duration_ns / 1.e6;
+            total_end_to_end_ms += info.cmd_total_duration_ns  / 1.e6;
         }
 
         // Dump a csv
-        fprintf(fperf, "op name, kernel name, exec duration (ms), global size, local size, output size\n");
+        fprintf(fperf,
+            "op name, kernel name, command type, queued duration (ms), submit duration (ms), exec duration (ms), complete duration (ms), total duration (ms), global size, local size, output size\n");
         for (const ProfilingInfo & info : profiling_info) {
-            fprintf(fperf, "%s,%s,%f,%zux%zux%zu,%zux%zux%zu,%zux%zux%zux%zu\n",
+            fprintf(fperf, "%s,%s,%s,%f,%f,%f,%f,%f,%zux%zux%zu,%zux%zux%zu,%zux%zux%zux%zu\n",
                 info.op_name.c_str(), info.kernel_name.c_str(),
+                info.command_type.c_str(),
+                info.cmd_queued_duration_ns/1.e6f,
+                info.cmd_submit_duration_ns/1.e6f,
                 info.cmd_duration_ns/1.e6f,
+                info.cmd_complete_duration_ns/1.e6f,
+                info.cmd_total_duration_ns/1.e6f,
                 info.global_size[0], info.global_size[1], info.global_size[2],
                 info.local_size[0], info.local_size[1], info.local_size[2],
                 info.output_size[0], info.output_size[1], info.output_size[2], info.output_size[3]);
         }
         fclose(fperf);
+
+        GGML_LOG_INFO(
+            "ggml_opencl: profiling summary: kernels=%zu queued=%.3f ms submit=%.3f ms exec=%.3f ms complete=%.3f ms total=%.3f ms\n",
+            profiling_info.size(),
+            total_queued_ms,
+            total_submit_ms,
+            total_exec_ms,
+            total_complete_ms,
+            total_end_to_end_ms);
 
         // Dump a simple chrome trace
         FILE* ftrace = fopen("cl_trace.json", "w");
@@ -674,15 +738,15 @@ struct ggml_backend_opencl_context {
 
         fprintf(ftrace, "[\n");
         for (const ProfilingInfo & info : profiling_info) {
-            fprintf(ftrace, "{\"name\": \"%s\", \"cat\": \"OpenCL\", \"ph\": \"B\", \"ts\": %" PRIu64 ", \"pid\": \"\", \"tid\": \"Host\"},\n",
-                info.kernel_name.c_str(), info.cmd_queued/1000);
-            fprintf(ftrace, "{\"name\": \"%s\", \"cat\": \"OpenCL\", \"ph\": \"E\", \"ts\": %" PRIu64 ", \"pid\": \"\", \"tid\": \"Host\"},\n",
-                info.kernel_name.c_str(), info.cmd_submit/1000);
+            fprintf(ftrace, "{\"name\": \"%s\", \"cat\": \"%s\", \"ph\": \"B\", \"ts\": %" PRIu64 ", \"pid\": \"\", \"tid\": \"Host\"},\n",
+                info.kernel_name.c_str(), info.command_type.c_str(), info.cmd_queued/1000);
+            fprintf(ftrace, "{\"name\": \"%s\", \"cat\": \"%s\", \"ph\": \"E\", \"ts\": %" PRIu64 ", \"pid\": \"\", \"tid\": \"Host\"},\n",
+                info.kernel_name.c_str(), info.command_type.c_str(), info.cmd_submit/1000);
 
-            fprintf(ftrace, "{\"name\": \"%s\", \"cat\": \"OpenCL\", \"ph\": \"B\", \"ts\": %" PRIu64 ", \"pid\": \"\", \"tid\": \"Device\"},\n",
-                info.kernel_name.c_str(), info.cmd_start/1000);
-            fprintf(ftrace, "{\"name\": \"%s\", \"cat\": \"OpenCL\", \"ph\": \"E\", \"ts\": %" PRIu64 ", \"pid\": \"\", \"tid\": \"Device\"},\n",
-                info.kernel_name.c_str(), info.cmd_end/1000);
+            fprintf(ftrace, "{\"name\": \"%s\", \"cat\": \"%s\", \"ph\": \"B\", \"ts\": %" PRIu64 ", \"pid\": \"\", \"tid\": \"Device\"},\n",
+                info.kernel_name.c_str(), info.command_type.c_str(), info.cmd_start/1000);
+            fprintf(ftrace, "{\"name\": \"%s\", \"cat\": \"%s\", \"ph\": \"E\", \"ts\": %" PRIu64 ", \"pid\": \"\", \"tid\": \"Device\"},\n",
+                info.kernel_name.c_str(), info.command_type.c_str(), info.cmd_end/1000);
         }
         fclose(ftrace);
     }
@@ -751,6 +815,19 @@ struct ggml_backend_opencl_context {
 #endif
     }
 
+    void enqueue_copy_buffer(cl_mem src_buffer, cl_mem dst_buffer, size_t src_offset, size_t dst_offset, size_t cb, const ggml_tensor * tensor, const char * command_name = "clEnqueueCopyBuffer") {
+#ifdef GGML_OPENCL_PROFILING
+        cl_event evt;
+        CL_CHECK(clEnqueueCopyBuffer(queue, src_buffer, dst_buffer, src_offset, dst_offset, cb, 0, NULL, &evt));
+        profiling_info.emplace_back();
+        populateProfilingInfoCommand(profiling_info.back(), evt, command_name, tensor, cb);
+#else
+        GGML_UNUSED(tensor);
+        GGML_UNUSED(command_name);
+        CL_CHECK(clEnqueueCopyBuffer(queue, src_buffer, dst_buffer, src_offset, dst_offset, cb, 0, NULL, NULL));
+#endif
+    }
+
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
     // Transpose kernels
     cl_program program_transpose;
@@ -803,6 +880,45 @@ static std::vector<ggml_backend_device> g_ggml_backend_opencl_devices;
 static bool ggml_opencl_uses_local_subgroup_compat(const ggml_backend_opencl_context * backend_ctx) {
     return backend_ctx->use_no_subgroups_compat ||
            backend_ctx->device_name.find("NVIDIA") != std::string::npos;
+}
+
+static size_t ggml_opencl_copy_buffer_min_bytes(void) {
+    static const size_t default_min_bytes = 64 * 1024;
+    static const size_t min_bytes = []() -> size_t {
+        const char * env = getenv("GGML_OPENCL_COPY_BUFFER_MIN_BYTES");
+        if (env == nullptr || env[0] == '\0') {
+            return default_min_bytes;
+        }
+
+        size_t value = default_min_bytes;
+        auto result = std::from_chars(env, env + strlen(env), value);
+        if (result.ec != std::errc{} || result.ptr == env) {
+            GGML_LOG_WARN("%s: ignoring invalid GGML_OPENCL_COPY_BUFFER_MIN_BYTES='%s'\n", __func__, env);
+            return default_min_bytes;
+        }
+
+        return value;
+    }();
+
+    return min_bytes;
+}
+
+static bool ggml_opencl_use_copy_buffer_fast_path(const ggml_backend_opencl_context * backend_ctx, size_t size) {
+    if (getenv("GGML_OPENCL_FORCE_COPY_BUFFER_FAST_PATH") != nullptr) {
+        return true;
+    }
+
+    // Apple's OpenCL runtime accepts clEnqueueCopyBuffer here, but on M1 it
+    // shifts copy cost into large unprofiled runtime overhead and regresses
+    // end-to-end throughput versus the existing cpy kernels.
+    if (backend_ctx->device_name.find("Apple") != std::string::npos) {
+        return false;
+    }
+
+    // For small contiguous copies, the OpenCL copy command itself can dominate
+    // end-to-end latency. Prefer the existing copy kernels until the payload is
+    // large enough to amortize the driver submission cost.
+    return size >= ggml_opencl_copy_buffer_min_bytes();
 }
 
 inline std::string read_file(const std::string &path) {
@@ -3370,6 +3486,7 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
     GGML_LOG_INFO("ggml_opencl: device max workgroup size: %lu\n", backend_ctx->max_workgroup_size);
 
     // Check SVM.
+    #if defined(CL_DEVICE_SVM_CAPABILITIES) && defined(CL_DEVICE_SVM_COARSE_GRAIN_BUFFER) && defined(CL_DEVICE_SVM_FINE_GRAIN_BUFFER) && defined(CL_DEVICE_SVM_FINE_GRAIN_SYSTEM) && defined(CL_DEVICE_SVM_ATOMICS)
     if (opencl_c_version.major >= 2) {
         cl_device_svm_capabilities svm_caps;
         CL_CHECK(clGetDeviceInfo(device, CL_DEVICE_SVM_CAPABILITIES, sizeof(cl_device_svm_capabilities), &svm_caps, 0));
@@ -3385,12 +3502,15 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
         GGML_LOG_INFO("ggml_opencl: SVM support unavailable on OpenCL %d.%d runtime\n",
             opencl_c_version.major, opencl_c_version.minor);
     }
+    #else
+    GGML_LOG_INFO("ggml_opencl: SVM capability query unavailable in this OpenCL SDK\n");
+    #endif
 
     if (opencl_c_version.major >= 3) {
         // Assume it is not available for 3.0, since it is optional in 3.0.
         // If compiling against 3.0, then we can query.
         backend_ctx->non_uniform_workgroups = false;
-#if CL_TARGET_OPENCL_VERSION >= 300
+#if defined(CL_VERSION_3_0) && defined(CL_DEVICE_NON_UNIFORM_WORK_GROUP_SUPPORT) && CL_TARGET_OPENCL_VERSION >= 300
         CL_CHECK(clGetDeviceInfo(device, CL_DEVICE_NON_UNIFORM_WORK_GROUP_SUPPORT, sizeof(cl_bool),
                                  &backend_ctx->non_uniform_workgroups, 0));
 #endif
@@ -3539,11 +3659,15 @@ static void transpose_2d(
         global_size, local_size, 0, NULL, NULL));
 
     if (blocking) {
-        CL_CHECK(clEnqueueCopyBuffer(backend_ctx->queue, trans, dst, 0, 0, size, 0, NULL, &evt));
+        backend_ctx->enqueue_copy_buffer(trans, dst, 0, 0, size, nullptr, "transpose_copy");
+#ifdef GGML_OPENCL_PROFILING
+        evt = backend_ctx->profiling_info.back().evt;
         CL_CHECK(clWaitForEvents(1, &evt));
-        CL_CHECK(clReleaseEvent(evt));
+#else
+        CL_CHECK(clFinish(backend_ctx->queue));
+#endif
     } else {
-        CL_CHECK(clEnqueueCopyBuffer(backend_ctx->queue, trans, dst, 0, 0, size, 0, NULL, NULL));
+        backend_ctx->enqueue_copy_buffer(trans, dst, 0, 0, size, nullptr, "transpose_copy");
     }
 
     CL_CHECK(clReleaseMemObject(trans));
@@ -4030,6 +4154,60 @@ static bool ggml_opencl_can_fuse(const struct ggml_cgraph * cgraph, int node_idx
     return true;
 }
 
+static bool ggml_opencl_can_fuse_cont_mul_mat(const struct ggml_cgraph * cgraph, int node_idx) {
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, { GGML_OP_CONT, GGML_OP_MUL_MAT }, { node_idx + 1 }) ||
+        !ggml_check_edges(cgraph, node_idx, { { 1, 1, 0 } })) {
+        return false;
+    }
+
+    const ggml_tensor * cont = cgraph->nodes[node_idx];
+    const ggml_tensor * mul  = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * src1 = cont->src[0];
+
+    GGML_ASSERT(cont->src[0] == mul->src[1]);
+
+    // This fusion only elides CONT when it is reshaping an already-contiguous
+    // PERMUTE view before a matmul. The common generation-time kqv_out path in
+    // non-FA attention matches this pattern on Qwen3, so we can reuse the
+    // existing flat matmul kernels without materializing the temporary buffer.
+    if (src1 == nullptr || src1->op != GGML_OP_PERMUTE || !ggml_is_contiguous(src1)) {
+        return false;
+    }
+
+    if (src1->type != cont->type || cont->type != mul->src[1]->type) {
+        return false;
+    }
+
+    if (ggml_nbytes(src1) != ggml_nbytes(cont)) {
+        return false;
+    }
+
+    if (mul->src[0]->type != GGML_TYPE_Q4_0 || mul->src[1]->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    if (!ggml_is_contiguous(mul->src[0])) {
+        return false;
+    }
+
+    return ggml_cl_can_mul_mat(mul->src[0], cont, const_cast<ggml_tensor *>(mul));
+}
+
+static void ggml_opencl_op_cont_mul_mat_fused(ggml_backend_t backend, ggml_tensor * cont_tensor, ggml_tensor * mul_tensor) {
+    GGML_ASSERT(cont_tensor != nullptr);
+    GGML_ASSERT(mul_tensor != nullptr);
+    GGML_ASSERT(cont_tensor->src[0] == mul_tensor->src[1]);
+
+    ggml_tensor reshaped_src1 = *cont_tensor->src[0];
+
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        reshaped_src1.ne[i] = cont_tensor->ne[i];
+        reshaped_src1.nb[i] = cont_tensor->nb[i];
+    }
+
+    ggml_cl_mul_mat(backend, mul_tensor->src[0], &reshaped_src1, mul_tensor);
+}
+
 static void ggml_opencl_op_rms_norm_fused(ggml_backend_t backend, ggml_tensor * rms_norm_tensor, ggml_tensor * mul_tensor);
 static void ggml_opencl_op_norm_fused(ggml_backend_t backend, ggml_tensor * norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
 static void ggml_opencl_op_group_norm_fused(ggml_backend_t backend, ggml_tensor * gn_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
@@ -4065,6 +4243,11 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
         }
         if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
             ggml_opencl_op_rms_norm_fused(backend, node, cgraph->nodes[i+1]);
+            i++;
+            continue;
+        }
+        if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse_cont_mul_mat(cgraph, i)) {
+            ggml_opencl_op_cont_mul_mat_fused(backend, node, cgraph->nodes[i+1]);
             i++;
             continue;
         }
@@ -5025,10 +5208,20 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
 
         // Copy transposed data into the sub-buffers (clEnqueueCopyBuffer to
         // a sub-buffer is valid even on Qualcomm).
-        CL_CHECK(clEnqueueCopyBuffer(queue, qT_d, extra->q, 0, 0, q_size_bytes, 0, NULL, &evt));
+        backend_ctx->enqueue_copy_buffer(qT_d, extra->q, 0, 0, q_size_bytes, tensor, "quant_transpose_q_copy");
+#ifdef GGML_OPENCL_PROFILING
+        evt = backend_ctx->profiling_info.back().evt;
         CL_CHECK(clWaitForEvents(1, &evt));
-        CL_CHECK(clEnqueueCopyBuffer(queue, dT_d, extra->d, 0, 0, d_size_bytes, 0, NULL, &evt));
+#else
+        CL_CHECK(clFinish(queue));
+#endif
+        backend_ctx->enqueue_copy_buffer(dT_d, extra->d, 0, 0, d_size_bytes, tensor, "quant_transpose_d_copy");
+#ifdef GGML_OPENCL_PROFILING
+        evt = backend_ctx->profiling_info.back().evt;
         CL_CHECK(clWaitForEvents(1, &evt));
+#else
+        CL_CHECK(clFinish(queue));
+#endif
 
         // Release sub-buffers and images (prealloc_quant_src/scales_src are
         // persistent — do NOT release them here).
@@ -5456,11 +5649,21 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
             CL_CHECK(clWaitForEvents(1, &evt));
 
             // copy transposed buffer contents to original buffers
-            CL_CHECK(clEnqueueCopyBuffer(queue, qT_d, extra->q, 0, 0, q_size_bytes, 0, NULL, &evt));
+            backend_ctx->enqueue_copy_buffer(qT_d, extra->q, 0, 0, q_size_bytes, tensor, "quant_transpose_q_copy");
+#ifdef GGML_OPENCL_PROFILING
+            evt = backend_ctx->profiling_info.back().evt;
             CL_CHECK(clWaitForEvents(1, &evt));
+#else
+            CL_CHECK(clFinish(queue));
+#endif
 
-            CL_CHECK(clEnqueueCopyBuffer(queue, dT_d, extra->d, 0, 0, d_size_bytes, 0, NULL, &evt));
+            backend_ctx->enqueue_copy_buffer(dT_d, extra->d, 0, 0, d_size_bytes, tensor, "quant_transpose_d_copy");
+#ifdef GGML_OPENCL_PROFILING
+            evt = backend_ctx->profiling_info.back().evt;
             CL_CHECK(clWaitForEvents(1, &evt));
+#else
+            CL_CHECK(clFinish(queue));
+#endif
 
             CL_CHECK(clReleaseMemObject(qT_d));
             CL_CHECK(clReleaseMemObject(dT_d));
@@ -6699,6 +6902,14 @@ static void ggml_cl_copy_to_contiguous(ggml_backend_t backend, const ggml_tensor
 
     cl_ulong offset0 = extra->offset + src->view_offs;
     cl_ulong offsetd = 0;
+
+    const size_t size = ggml_nbytes(src);
+    if (ggml_is_contiguous(src) && ggml_opencl_use_copy_buffer_fast_path(backend_ctx, size)) {
+        if (size > 0) {
+            backend_ctx->enqueue_copy_buffer(extra->data_device, dst, offset0, offsetd, size, src, "cpy_contiguous_buffer");
+        }
+        return;
+    }
 
     cl_kernel kernel;
 
@@ -9913,7 +10124,7 @@ static void ggml_cl_conv_2d(ggml_backend_t backend, const ggml_tensor * src0, co
 
     if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F16) {
         kernel = backend_ctx->kernel_conv_2d_f16;
-        shmem_size = (size_t)(BS_K * BS_CRS * sizeof(cl_half) + BS_CRS * (BS_NPQ / VEC_SIZE) * sizeof(cl_half4));
+        shmem_size = (size_t)(BS_K * BS_CRS * sizeof(cl_half) + BS_CRS * (BS_NPQ / VEC_SIZE) * (4 * sizeof(cl_half)));
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) {
         kernel = backend_ctx->kernel_conv_2d_f32;
         shmem_size = (size_t)(BS_K * BS_CRS * sizeof(cl_float) + BS_CRS * (BS_NPQ / VEC_SIZE) * sizeof(cl_float4));
@@ -10951,7 +11162,8 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
     cl_context context = backend_ctx->context;
 
-    if(src0t == GGML_TYPE_F16 && src1t == GGML_TYPE_F32){
+    if (backend_ctx->gpu_family == GPU_FAMILY::ADRENO &&
+        src0t == GGML_TYPE_F16 && src1t == GGML_TYPE_F32) {
         if (ne01 >= 64 && ne1 >= 32 && ne00 >= 16 && (ne12 % ne02) == 0  &&
             // dst is wrapped with image1d_buffer, the size limit applies, also src0
             (ne0 * ne1 * dst->ne[2] * dst->nb[0] / 4 <= backend_ctx->image_max_buffer_size)) {
@@ -12934,6 +13146,23 @@ static void ggml_cl_cpy(ggml_backend_t backend, const ggml_tensor * src0, const 
 
     cl_ulong offset0 = extra0->offset + src0->view_offs;
     cl_ulong offset1 = extra1->offset + src1->view_offs;
+
+    if (src0t == src1t &&
+        ggml_is_contiguous(src0) &&
+        ggml_is_contiguous(src1) &&
+        ggml_nbytes(src0) == ggml_nbytes(src1)) {
+        if (extra0->data_device == extra1->data_device && offset0 == offset1) {
+            return;
+        }
+
+        const size_t size = ggml_nbytes(src0);
+        if (ggml_opencl_use_copy_buffer_fast_path(backend_ctx, size)) {
+            if (size > 0) {
+                backend_ctx->enqueue_copy_buffer(extra0->data_device, extra1->data_device, offset0, offset1, size, src1, "cpy_same_type_buffer");
+            }
+            return;
+        }
+    }
 
     cl_kernel kernel;
 
