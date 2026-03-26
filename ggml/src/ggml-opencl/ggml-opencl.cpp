@@ -4164,7 +4164,7 @@ static bool ggml_opencl_can_fuse_cont_mul_mat(const struct ggml_cgraph * cgraph,
     const ggml_tensor * mul  = cgraph->nodes[node_idx + 1];
     const ggml_tensor * src1 = cont->src[0];
 
-    GGML_ASSERT(cont->src[0] == mul->src[1]);
+    GGML_ASSERT(cont == mul->src[1]);
 
     // This fusion only elides CONT when it is reshaping an already-contiguous
     // PERMUTE view before a matmul. The common generation-time kqv_out path in
@@ -4196,7 +4196,7 @@ static bool ggml_opencl_can_fuse_cont_mul_mat(const struct ggml_cgraph * cgraph,
 static void ggml_opencl_op_cont_mul_mat_fused(ggml_backend_t backend, ggml_tensor * cont_tensor, ggml_tensor * mul_tensor) {
     GGML_ASSERT(cont_tensor != nullptr);
     GGML_ASSERT(mul_tensor != nullptr);
-    GGML_ASSERT(cont_tensor->src[0] == mul_tensor->src[1]);
+    GGML_ASSERT(cont_tensor == mul_tensor->src[1]);
 
     ggml_tensor reshaped_src1 = *cont_tensor->src[0];
 
@@ -12404,6 +12404,10 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 nth1 = 1;
                 ndst = 4;
             } else if (backend_ctx->gpu_family == INTEL) {
+                // nth0=16 for both true Intel and Apple M1 compat mode.
+                // In compat mode the kernel overrides BLOCK_STRIDE to 2 so
+                // that ix ∈ {0,1} (lid/8 with 16 threads) covers all
+                // super-blocks, and uses lm[N_DST*16] for the tree-reduction.
                 nth0 = 16;
                 nth1 = 1;
                 ndst = 4;
