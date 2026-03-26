@@ -64,24 +64,40 @@ kernel void kernel_mul_mat_f16_f32_l4(
     global half4 * x4 = (global half4 *) (src0 + offset_src0);
 
 #ifdef NVIDIA_GPU
-    if (get_local_id(0) != 0) {
-        return;
-    }
+    // Parallel local-memory reduction: all 32 threads collaborate on each dot product.
+    // Replaces the original single-threaded path (thread 0 only) for Apple M1 OpenCL.
+    __local float lm[32];
+    int lid = get_local_id(0);
 
     for (int r1 = 0; r1 < nrows; ++r1) {
-        ulong offset_src1 = r1*nb11 + (i12   )*nb12 + (i13   )*nb13;
+        ulong offset_src1 = r1*nb11 + (i12)*nb12 + (i13)*nb13;
+        global float4 * y4 = (global float4 *)(src1 + offset_src1);
 
-        float all_sum_nv = 0.0f;
-        for (int i = 0; i < ne00; ++i) {
-            global half  * x_elem = (global half  *) (src0 + offset_src0 + (ulong) i * nb00);
-            global float * y_elem = (global float *) (src1 + offset_src1 + (ulong) i * nb10);
-            all_sum_nv += (float) x_elem[0] * y_elem[0];
+        float sumf = 0.0f;
+        for (int i = lid; i < ne00/4; i += 32) {
+            sumf += (float)x4[i].s0 * y4[i].s0;
+            sumf += (float)x4[i].s1 * y4[i].s1;
+            sumf += (float)x4[i].s2 * y4[i].s2;
+            sumf += (float)x4[i].s3 * y4[i].s3;
         }
-        dst[im*ne1*ne0 + r1*ne0 + r0] = all_sum_nv;
+
+        lm[lid] = sumf;
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        for (int s = 16; s > 0; s >>= 1) {
+            if (lid < s) {
+                lm[lid] += lm[lid + s];
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+
+        if (lid == 0) {
+            dst[im*ne1*ne0 + r1*ne0 + r0] = lm[0];
+        }
     }
     return;
-#endif
-
+#else
+    // Subgroup path for Adreno and other GPUs with native subgroup support.
     for (int r1 = 0; r1 < nrows; ++r1) {
         ulong offset_src1 = r1*nb11 + (i12   )*nb12 + (i13   )*nb13;
 
@@ -100,4 +116,5 @@ kernel void kernel_mul_mat_f16_f32_l4(
             dst[im*ne1*ne0 + r1*ne0 + r0] = all_sum;
         }
     }
+#endif
 }
