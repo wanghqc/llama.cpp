@@ -636,6 +636,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mm_q8_0_f32_l4_lm;
     cl_kernel kernel_mul_mm_q4_k_f32_l4_lm;
     cl_kernel kernel_mul_mm_q6_k_f32_l4_lm;
+    cl_kernel kernel_mul_mm_q4_k_f32_l4_lm = nullptr;
+    cl_kernel kernel_mul_mm_q4_k_f32_l4_lm_packed = nullptr;
 
     std::vector<ProfilingInfo> profiling_info;
 
@@ -1848,6 +1850,40 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
 
         CL_CHECK((backend_ctx->kernel_mul_mm_q6_k_f32_l4_lm = clCreateKernel(prog, "kernel_mul_mm_q6_k_f32_l4_lm", &err), err));
         CL_CHECK(clReleaseProgram(prog));
+        GGML_LOG_CONT(".");
+    }
+
+    // mul_mm_q4_k_f32_l4_lm (SOA batch GEMM for Q4_K weights)
+#ifdef GGML_OPENCL_SOA_Q
+    {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src_q4k_mm {
+            #include "mul_mm_q4_k_f32_l4_lm.cl.h"
+        };
+#else
+        const std::string kernel_src_q4k_mm = read_file("mul_mm_q4_k_f32_l4_lm.cl");
+#endif
+        cl_program prog_q4k_mm =
+            build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src_q4k_mm.c_str(), compile_opts);
+        CL_CHECK((backend_ctx->kernel_mul_mm_q4_k_f32_l4_lm = clCreateKernel(prog_q4k_mm, "kernel_mul_mm_q4_k_f32_l4_lm", &err), err));
+        CL_CHECK(clReleaseProgram(prog_q4k_mm));
+        GGML_LOG_CONT(".");
+    }
+#endif // GGML_OPENCL_SOA_Q
+
+    // mul_mm_q4_k_f32_l4_lm_packed (packed AoS batch GEMM for Q4_K, no SOA needed)
+    {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src_q4k_mm_packed {
+            #include "mul_mm_q4_k_f32_l4_lm_packed.cl.h"
+        };
+#else
+        const std::string kernel_src_q4k_mm_packed = read_file("mul_mm_q4_k_f32_l4_lm_packed.cl");
+#endif
+        cl_program prog_q4k_mm_packed =
+            build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src_q4k_mm_packed.c_str(), compile_opts);
+        CL_CHECK((backend_ctx->kernel_mul_mm_q4_k_f32_l4_lm_packed = clCreateKernel(prog_q4k_mm_packed, "kernel_mul_mm_q4_k_f32_l4_lm_packed", &err), err));
+        CL_CHECK(clReleaseProgram(prog_q4k_mm_packed));
         GGML_LOG_CONT(".");
     }
 
@@ -5682,6 +5718,11 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         backend_ctx->device_name.find("NVIDIA") != std::string::npos) {
         // Only convert full tensor writes (weight loading).  Partial writes
         // (e.g. KV-cache updates) bypass SOA and fall through to the pool write.
+        //
+        // Apple M1 is excluded: SOA doubles Q4_K GPU memory (packed AoS + 4 SOA
+        // sub-buffers coexist during conversion), causing OOM on 3B+ models
+        // (max_mem_alloc=1024 MB).  Apple M1 uses the packed-format GEMM kernel
+        // (kernel_mul_mm_q4_k_f32_l4_lm_packed) instead.
         //
         // Adreno is intentionally excluded: benchmarks show the flat kernel is
         // ~40% slower than the packed Adreno kernel (56 t/s vs 95 t/s on 1B
@@ -11872,6 +11913,87 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 
                 backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
                 return;
+            }
+            case GGML_TYPE_Q4_K: {
+                if (ne11 < 32) {
+                    break;
+                }
+                if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1)) {
+                    break;
+                }
+#ifdef GGML_OPENCL_SOA_Q
+                // Only dispatch if tensor was successfully converted to SOA at load time.
+                if (src0->buffer == nullptr ||
+                    ((ggml_backend_opencl_buffer_context*)src0->buffer->context)->soa_q4_K_tensors.count(src0) == 0) {
+                    break;
+                }
+
+                kernel = backend_ctx->kernel_mul_mm_q4_k_f32_l4_lm;
+                nth0 = 128; // (BM*BN)/(TM*TN) = (64*64)/(4*8)
+
+                int batch_stride_b = ne10*ne11;
+                int batch_stride_d = ne0*ne1;
+
+                CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0_q4_K->qs));
+                CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_mem),   &extra0_q4_K->scales));
+                CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &extra0_q4_K->d));
+                CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_mem),   &extra0_q4_K->dmin));
+                CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_mem),   &extra1->data_device));
+                CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_ulong), &offset1));
+                CL_CHECK(clSetKernelArg(kernel,  6, sizeof(cl_mem),   &extrad->data_device));
+                CL_CHECK(clSetKernelArg(kernel,  7, sizeof(cl_ulong), &offsetd));
+                CL_CHECK(clSetKernelArg(kernel,  8, sizeof(int),      &ne00));
+                CL_CHECK(clSetKernelArg(kernel,  9, sizeof(int),      &ne01));
+                CL_CHECK(clSetKernelArg(kernel, 10, sizeof(int),      &ne02));
+                CL_CHECK(clSetKernelArg(kernel, 11, sizeof(int),      &ne11));
+                CL_CHECK(clSetKernelArg(kernel, 12, sizeof(int),      &ne12));
+                CL_CHECK(clSetKernelArg(kernel, 13, sizeof(int),      &ne10)); // stride_b
+                CL_CHECK(clSetKernelArg(kernel, 14, sizeof(int),      &ne01)); // stride_d
+                CL_CHECK(clSetKernelArg(kernel, 15, sizeof(int),      &batch_stride_b));
+                CL_CHECK(clSetKernelArg(kernel, 16, sizeof(int),      &batch_stride_d));
+                CL_CHECK(clSetKernelArg(kernel, 17, sizeof(int),      &r2));
+                CL_CHECK(clSetKernelArg(kernel, 18, sizeof(int),      &r3));
+
+                // 64 is block tile size BM and BN - change here when BM and BN in the kernel are changed.
+                size_t global_work_size_q4k[] = {(size_t)(CEIL_DIV(ne01, 64)*nth0), (size_t)(CEIL_DIV(ne11, 64)), (size_t)ne12*ne13};
+                size_t local_work_size_q4k[]  = {(size_t)nth0, 1, 1};
+
+                backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size_q4k, local_work_size_q4k, dst);
+                return;
+#else
+                // Packed AoS GEMM: reads directly from block_q4_K buffer, no SOA needed.
+                {
+                    cl_kernel kp = backend_ctx->kernel_mul_mm_q4_k_f32_l4_lm_packed;
+                    int nth0_packed = 128;
+
+                    int batch_stride_b = ne10 * ne11;
+                    int batch_stride_d = ne0 * ne1;
+
+                    CL_CHECK(clSetKernelArg(kp,  0, sizeof(cl_mem),   &extra0->data_device));
+                    CL_CHECK(clSetKernelArg(kp,  1, sizeof(cl_ulong), &offset0));
+                    CL_CHECK(clSetKernelArg(kp,  2, sizeof(cl_mem),   &extra1->data_device));
+                    CL_CHECK(clSetKernelArg(kp,  3, sizeof(cl_ulong), &offset1));
+                    CL_CHECK(clSetKernelArg(kp,  4, sizeof(cl_mem),   &extrad->data_device));
+                    CL_CHECK(clSetKernelArg(kp,  5, sizeof(cl_ulong), &offsetd));
+                    CL_CHECK(clSetKernelArg(kp,  6, sizeof(int),      &ne00));
+                    CL_CHECK(clSetKernelArg(kp,  7, sizeof(int),      &ne01));
+                    CL_CHECK(clSetKernelArg(kp,  8, sizeof(int),      &ne02));
+                    CL_CHECK(clSetKernelArg(kp,  9, sizeof(int),      &ne11));
+                    CL_CHECK(clSetKernelArg(kp, 10, sizeof(int),      &ne12));
+                    CL_CHECK(clSetKernelArg(kp, 11, sizeof(int),      &ne10)); // stride_b
+                    CL_CHECK(clSetKernelArg(kp, 12, sizeof(int),      &ne01)); // stride_d
+                    CL_CHECK(clSetKernelArg(kp, 13, sizeof(int),      &batch_stride_b));
+                    CL_CHECK(clSetKernelArg(kp, 14, sizeof(int),      &batch_stride_d));
+                    CL_CHECK(clSetKernelArg(kp, 15, sizeof(int),      &r2));
+                    CL_CHECK(clSetKernelArg(kp, 16, sizeof(int),      &r3));
+
+                    size_t gws[] = {(size_t)(CEIL_DIV(ne01, 64)*nth0_packed), (size_t)(CEIL_DIV(ne11, 64)), (size_t)ne12*ne13};
+                    size_t lws[] = {(size_t)nth0_packed, 1, 1};
+
+                    backend_ctx->enqueue_ndrange_kernel(kp, 3, gws, lws, dst);
+                    return;
+                }
+#endif
             }
             default:
                 break;
