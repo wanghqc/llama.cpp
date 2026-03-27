@@ -638,6 +638,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mm_q6_k_f32_l4_lm;
     cl_kernel kernel_mul_mm_q4_k_f32_l4_lm = nullptr;
     cl_kernel kernel_mul_mm_q4_k_f32_l4_lm_packed = nullptr;
+    cl_kernel kernel_mul_mm_q4_k_f32_l4_lm_qst    = nullptr;
 
     std::vector<ProfilingInfo> profiling_info;
 
@@ -1884,6 +1885,22 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
             build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src_q4k_mm_packed.c_str(), compile_opts);
         CL_CHECK((backend_ctx->kernel_mul_mm_q4_k_f32_l4_lm_packed = clCreateKernel(prog_q4k_mm_packed, "kernel_mul_mm_q4_k_f32_l4_lm_packed", &err), err));
         CL_CHECK(clReleaseProgram(prog_q4k_mm_packed));
+        GGML_LOG_CONT(".");
+    }
+
+    // mul_mm_q4_k_f32_l4_lm_qst (coalesced qs_t GEMM for Apple M1 / non-NVIDIA)
+    {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src_q4k_qst {
+            #include "mul_mm_q4_k_f32_l4_lm_qst.cl.h"
+        };
+#else
+        const std::string kernel_src_q4k_qst = read_file("mul_mm_q4_k_f32_l4_lm_qst.cl");
+#endif
+        cl_program prog_q4k_qst =
+            build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src_q4k_qst.c_str(), compile_opts);
+        CL_CHECK((backend_ctx->kernel_mul_mm_q4_k_f32_l4_lm_qst = clCreateKernel(prog_q4k_qst, "kernel_mul_mm_q4_k_f32_l4_lm_qst", &err), err));
+        CL_CHECK(clReleaseProgram(prog_q4k_qst));
         GGML_LOG_CONT(".");
     }
 
@@ -4723,6 +4740,9 @@ struct ggml_backend_opencl_buffer_context {
         for (ggml_tensor_extra_cl_q6_K * e : temp_tensor_extras_q6_K_in_use) {
             delete e;
         }
+        for (auto & kv : q4k_qs_t_buffers) {
+            if (kv.second) { CL_CHECK(clReleaseMemObject(kv.second)); }
+        }
     }
 
     ggml_tensor_extra_cl * ggml_opencl_alloc_temp_tensor_extra() {
@@ -4909,6 +4929,11 @@ struct ggml_backend_opencl_buffer_context {
     // When a tensor is NOT in this set (e.g., SOA allocation failed due to OOM),
     // mul_mat falls back to the packed kernel using the pool buffer.
     std::unordered_set<const ggml_tensor *> soa_q4_K_tensors;
+
+    // Per-tensor qs_t buffer: qs in [batch, nb, ne01, 128] order for coalesced
+    // GEMM access on Apple M1 (no SOA).  The original packed buffer is kept
+    // for GEMV; this buffer is freed when the buffer context is destroyed.
+    std::unordered_map<const ggml_tensor *, cl_mem> q4k_qs_t_buffers;
     std::vector<ggml_tensor_extra_cl_q6_K *> temp_tensor_extras_q6_K;
     std::vector<ggml_tensor_extra_cl_q6_K *> temp_tensor_extras_q6_K_in_use;
 
@@ -5783,6 +5808,54 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         tensor->extra = extra;
         ctx->soa_q4_K_tensors.insert(tensor);
         return;
+    }
+    // Non-NVIDIA Q4_K: build qs_t buffer in [batch, nb, ne01, 128] order for
+    // coalesced GEMM tile loads.  Adjacent threads read stride-128-byte-apart
+    // addresses instead of the packed format's nb*144 = 1728-byte stride.
+    // The original packed buffer is preserved in the pool for GEMV.
+    if (tensor->type == GGML_TYPE_Q4_K &&
+        offset == 0 && size == ggml_nbytes(tensor) &&
+        backend_ctx->device_name.find("NVIDIA") == std::string::npos) {
+
+        const int ne01_t = tensor->ne[1];
+        const int ne23   = tensor->ne[2] * tensor->ne[3];
+        const int nb_row = tensor->ne[0] / 256;   // super-blocks per row (QK_K=256)
+        const size_t n_blocks  = (size_t)ne01_t * ne23 * nb_row;
+        const size_t size_qs_t = n_blocks * 128;
+
+        // Reorganize qs on the CPU into [ne23, nb_row, ne01, 128] layout
+        std::vector<uint8_t> qs_t_cpu(size_qs_t);
+        const uint8_t * src_data = (const uint8_t *)data;
+
+        for (int b23 = 0; b23 < ne23; b23++) {
+            for (int r = 0; r < ne01_t; r++) {
+                for (int ib = 0; ib < nb_row; ib++) {
+                    // Source: packed block at row-major index
+                    const uint8_t * bp = src_data +
+                        (size_t)(b23 * ne01_t * nb_row + r * nb_row + ib) * 144; // BLOCK_Q4_K_SZ
+                    // Destination: [b23, ib, r] in qs_t
+                    uint8_t * dst_qs = qs_t_cpu.data() +
+                        (size_t)(b23 * nb_row * ne01_t + ib * ne01_t + r) * 128;
+                    memcpy(dst_qs, bp + 16, 128);
+                }
+            }
+        }
+
+        cl_int err;
+        cl_mem qs_t_buf = clCreateBuffer(
+            backend_ctx->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+            size_qs_t, qs_t_cpu.data(), &err);
+        ggml_backend_opencl_buffer_context * buf_ctx =
+            (ggml_backend_opencl_buffer_context *) buffer->context;
+        if (err == CL_SUCCESS) {
+            buf_ctx->q4k_qs_t_buffers[tensor] = qs_t_buf;
+            GGML_LOG_DEBUG("ggml_opencl: Q4_K qs_t buffer created (%.1f MB) for coalesced GEMM\n",
+                           size_qs_t / 1048576.0);
+        } else {
+            GGML_LOG_WARN("ggml_opencl: Q4_K qs_t buffer allocation failed (%.1f MB) — "
+                          "falling back to packed GEMM\n", size_qs_t / 1048576.0);
+        }
+        // Fall through: packed data is still written to pool buffer (for GEMV)
     }
     if (tensor->type == GGML_TYPE_Q6_K) {
         ggml_tensor_extra_cl * extra_orig = (ggml_tensor_extra_cl *)tensor->extra;
@@ -11922,75 +11995,99 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     break;
                 }
 #ifdef GGML_OPENCL_SOA_Q
-                // Only dispatch if tensor was successfully converted to SOA at load time.
-                if (src0->buffer == nullptr ||
-                    ((ggml_backend_opencl_buffer_context*)src0->buffer->context)->soa_q4_K_tensors.count(src0) == 0) {
-                    break;
-                }
-
-                kernel = backend_ctx->kernel_mul_mm_q4_k_f32_l4_lm;
-                nth0 = 128; // (BM*BN)/(TM*TN) = (64*64)/(4*8)
-
-                int batch_stride_b = ne10*ne11;
-                int batch_stride_d = ne0*ne1;
-
-                CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0_q4_K->qs));
-                CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_mem),   &extra0_q4_K->scales));
-                CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &extra0_q4_K->d));
-                CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_mem),   &extra0_q4_K->dmin));
-                CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_mem),   &extra1->data_device));
-                CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_ulong), &offset1));
-                CL_CHECK(clSetKernelArg(kernel,  6, sizeof(cl_mem),   &extrad->data_device));
-                CL_CHECK(clSetKernelArg(kernel,  7, sizeof(cl_ulong), &offsetd));
-                CL_CHECK(clSetKernelArg(kernel,  8, sizeof(int),      &ne00));
-                CL_CHECK(clSetKernelArg(kernel,  9, sizeof(int),      &ne01));
-                CL_CHECK(clSetKernelArg(kernel, 10, sizeof(int),      &ne02));
-                CL_CHECK(clSetKernelArg(kernel, 11, sizeof(int),      &ne11));
-                CL_CHECK(clSetKernelArg(kernel, 12, sizeof(int),      &ne12));
-                CL_CHECK(clSetKernelArg(kernel, 13, sizeof(int),      &ne10)); // stride_b
-                CL_CHECK(clSetKernelArg(kernel, 14, sizeof(int),      &ne01)); // stride_d
-                CL_CHECK(clSetKernelArg(kernel, 15, sizeof(int),      &batch_stride_b));
-                CL_CHECK(clSetKernelArg(kernel, 16, sizeof(int),      &batch_stride_d));
-                CL_CHECK(clSetKernelArg(kernel, 17, sizeof(int),      &r2));
-                CL_CHECK(clSetKernelArg(kernel, 18, sizeof(int),      &r3));
-
-                // 64 is block tile size BM and BN - change here when BM and BN in the kernel are changed.
-                size_t global_work_size_q4k[] = {(size_t)(CEIL_DIV(ne01, 64)*nth0), (size_t)(CEIL_DIV(ne11, 64)), (size_t)ne12*ne13};
-                size_t local_work_size_q4k[]  = {(size_t)nth0, 1, 1};
-
-                backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size_q4k, local_work_size_q4k, dst);
-                return;
-#else
-                // Packed AoS GEMM: reads directly from block_q4_K buffer, no SOA needed.
                 {
-                    cl_kernel kp = backend_ctx->kernel_mul_mm_q4_k_f32_l4_lm_packed;
-                    int nth0_packed = 128;
+                    // NVIDIA SOA path: tensor was converted to 4 separate buffers at load time.
+                    if (src0->buffer != nullptr &&
+                        ((ggml_backend_opencl_buffer_context*)src0->buffer->context)->soa_q4_K_tensors.count(src0) > 0) {
 
+                        kernel = backend_ctx->kernel_mul_mm_q4_k_f32_l4_lm;
+                        nth0 = 128; // (BM*BN)/(TM*TN) = (64*64)/(4*8)
+
+                        int batch_stride_b = ne10*ne11;
+                        int batch_stride_d = ne0*ne1;
+
+                        CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0_q4_K->qs));
+                        CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_mem),   &extra0_q4_K->scales));
+                        CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &extra0_q4_K->d));
+                        CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_mem),   &extra0_q4_K->dmin));
+                        CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_mem),   &extra1->data_device));
+                        CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_ulong), &offset1));
+                        CL_CHECK(clSetKernelArg(kernel,  6, sizeof(cl_mem),   &extrad->data_device));
+                        CL_CHECK(clSetKernelArg(kernel,  7, sizeof(cl_ulong), &offsetd));
+                        CL_CHECK(clSetKernelArg(kernel,  8, sizeof(int),      &ne00));
+                        CL_CHECK(clSetKernelArg(kernel,  9, sizeof(int),      &ne01));
+                        CL_CHECK(clSetKernelArg(kernel, 10, sizeof(int),      &ne02));
+                        CL_CHECK(clSetKernelArg(kernel, 11, sizeof(int),      &ne11));
+                        CL_CHECK(clSetKernelArg(kernel, 12, sizeof(int),      &ne12));
+                        CL_CHECK(clSetKernelArg(kernel, 13, sizeof(int),      &ne10)); // stride_b
+                        CL_CHECK(clSetKernelArg(kernel, 14, sizeof(int),      &ne01)); // stride_d
+                        CL_CHECK(clSetKernelArg(kernel, 15, sizeof(int),      &batch_stride_b));
+                        CL_CHECK(clSetKernelArg(kernel, 16, sizeof(int),      &batch_stride_d));
+                        CL_CHECK(clSetKernelArg(kernel, 17, sizeof(int),      &r2));
+                        CL_CHECK(clSetKernelArg(kernel, 18, sizeof(int),      &r3));
+
+                        size_t global_work_size_q4k[] = {(size_t)(CEIL_DIV(ne01, 64)*nth0), (size_t)(CEIL_DIV(ne11, 64)), (size_t)ne12*ne13};
+                        size_t local_work_size_q4k[]  = {(size_t)nth0, 1, 1};
+                        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size_q4k, local_work_size_q4k, dst);
+                        return;
+                    }
+
+                    // Non-NVIDIA (Apple M1 etc.): prefer qst kernel (coalesced qs access),
+                    // fall back to packed GEMM if qs_t buffer was not created (OOM).
+                    auto & qst_map = ((ggml_backend_opencl_buffer_context*)src0->buffer->context)->q4k_qs_t_buffers;
+                    const bool have_qst = src0->buffer != nullptr && qst_map.count(src0) > 0;
+
+                    int nth0_q4k = 128;
                     int batch_stride_b = ne10 * ne11;
                     int batch_stride_d = ne0 * ne1;
 
-                    CL_CHECK(clSetKernelArg(kp,  0, sizeof(cl_mem),   &extra0->data_device));
-                    CL_CHECK(clSetKernelArg(kp,  1, sizeof(cl_ulong), &offset0));
-                    CL_CHECK(clSetKernelArg(kp,  2, sizeof(cl_mem),   &extra1->data_device));
-                    CL_CHECK(clSetKernelArg(kp,  3, sizeof(cl_ulong), &offset1));
-                    CL_CHECK(clSetKernelArg(kp,  4, sizeof(cl_mem),   &extrad->data_device));
-                    CL_CHECK(clSetKernelArg(kp,  5, sizeof(cl_ulong), &offsetd));
-                    CL_CHECK(clSetKernelArg(kp,  6, sizeof(int),      &ne00));
-                    CL_CHECK(clSetKernelArg(kp,  7, sizeof(int),      &ne01));
-                    CL_CHECK(clSetKernelArg(kp,  8, sizeof(int),      &ne02));
-                    CL_CHECK(clSetKernelArg(kp,  9, sizeof(int),      &ne11));
-                    CL_CHECK(clSetKernelArg(kp, 10, sizeof(int),      &ne12));
-                    CL_CHECK(clSetKernelArg(kp, 11, sizeof(int),      &ne10)); // stride_b
-                    CL_CHECK(clSetKernelArg(kp, 12, sizeof(int),      &ne01)); // stride_d
-                    CL_CHECK(clSetKernelArg(kp, 13, sizeof(int),      &batch_stride_b));
-                    CL_CHECK(clSetKernelArg(kp, 14, sizeof(int),      &batch_stride_d));
-                    CL_CHECK(clSetKernelArg(kp, 15, sizeof(int),      &r2));
-                    CL_CHECK(clSetKernelArg(kp, 16, sizeof(int),      &r3));
+                    size_t gws[] = {(size_t)(CEIL_DIV(ne01, 64)*nth0_q4k), (size_t)(CEIL_DIV(ne11, 64)), (size_t)ne12*ne13};
+                    size_t lws[] = {(size_t)nth0_q4k, 1, 1};
 
-                    size_t gws[] = {(size_t)(CEIL_DIV(ne01, 64)*nth0_packed), (size_t)(CEIL_DIV(ne11, 64)), (size_t)ne12*ne13};
-                    size_t lws[] = {(size_t)nth0_packed, 1, 1};
-
-                    backend_ctx->enqueue_ndrange_kernel(kp, 3, gws, lws, dst);
+                    if (have_qst) {
+                        cl_kernel kq = backend_ctx->kernel_mul_mm_q4_k_f32_l4_lm_qst;
+                        cl_mem qs_t  = qst_map.at(src0);
+                        CL_CHECK(clSetKernelArg(kq,  0, sizeof(cl_mem),   &extra0->data_device)); // meta
+                        CL_CHECK(clSetKernelArg(kq,  1, sizeof(cl_ulong), &offset0));
+                        CL_CHECK(clSetKernelArg(kq,  2, sizeof(cl_mem),   &qs_t));
+                        CL_CHECK(clSetKernelArg(kq,  3, sizeof(cl_mem),   &extra1->data_device));
+                        CL_CHECK(clSetKernelArg(kq,  4, sizeof(cl_ulong), &offset1));
+                        CL_CHECK(clSetKernelArg(kq,  5, sizeof(cl_mem),   &extrad->data_device));
+                        CL_CHECK(clSetKernelArg(kq,  6, sizeof(cl_ulong), &offsetd));
+                        CL_CHECK(clSetKernelArg(kq,  7, sizeof(int),      &ne00));
+                        CL_CHECK(clSetKernelArg(kq,  8, sizeof(int),      &ne01));
+                        CL_CHECK(clSetKernelArg(kq,  9, sizeof(int),      &ne02));
+                        CL_CHECK(clSetKernelArg(kq, 10, sizeof(int),      &ne11));
+                        CL_CHECK(clSetKernelArg(kq, 11, sizeof(int),      &ne12));
+                        CL_CHECK(clSetKernelArg(kq, 12, sizeof(int),      &ne10)); // stride_b
+                        CL_CHECK(clSetKernelArg(kq, 13, sizeof(int),      &ne01)); // stride_d
+                        CL_CHECK(clSetKernelArg(kq, 14, sizeof(int),      &batch_stride_b));
+                        CL_CHECK(clSetKernelArg(kq, 15, sizeof(int),      &batch_stride_d));
+                        CL_CHECK(clSetKernelArg(kq, 16, sizeof(int),      &r2));
+                        CL_CHECK(clSetKernelArg(kq, 17, sizeof(int),      &r3));
+                        backend_ctx->enqueue_ndrange_kernel(kq, 3, gws, lws, dst);
+                    } else {
+                        // Packed fallback (qs_t buffer unavailable)
+                        cl_kernel kp = backend_ctx->kernel_mul_mm_q4_k_f32_l4_lm_packed;
+                        CL_CHECK(clSetKernelArg(kp,  0, sizeof(cl_mem),   &extra0->data_device));
+                        CL_CHECK(clSetKernelArg(kp,  1, sizeof(cl_ulong), &offset0));
+                        CL_CHECK(clSetKernelArg(kp,  2, sizeof(cl_mem),   &extra1->data_device));
+                        CL_CHECK(clSetKernelArg(kp,  3, sizeof(cl_ulong), &offset1));
+                        CL_CHECK(clSetKernelArg(kp,  4, sizeof(cl_mem),   &extrad->data_device));
+                        CL_CHECK(clSetKernelArg(kp,  5, sizeof(cl_ulong), &offsetd));
+                        CL_CHECK(clSetKernelArg(kp,  6, sizeof(int),      &ne00));
+                        CL_CHECK(clSetKernelArg(kp,  7, sizeof(int),      &ne01));
+                        CL_CHECK(clSetKernelArg(kp,  8, sizeof(int),      &ne02));
+                        CL_CHECK(clSetKernelArg(kp,  9, sizeof(int),      &ne11));
+                        CL_CHECK(clSetKernelArg(kp, 10, sizeof(int),      &ne12));
+                        CL_CHECK(clSetKernelArg(kp, 11, sizeof(int),      &ne10)); // stride_b
+                        CL_CHECK(clSetKernelArg(kp, 12, sizeof(int),      &ne01)); // stride_d
+                        CL_CHECK(clSetKernelArg(kp, 13, sizeof(int),      &batch_stride_b));
+                        CL_CHECK(clSetKernelArg(kp, 14, sizeof(int),      &batch_stride_d));
+                        CL_CHECK(clSetKernelArg(kp, 15, sizeof(int),      &r2));
+                        CL_CHECK(clSetKernelArg(kp, 16, sizeof(int),      &r3));
+                        backend_ctx->enqueue_ndrange_kernel(kp, 3, gws, lws, dst);
+                    }
                     return;
                 }
 #endif
