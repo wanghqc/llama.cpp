@@ -638,7 +638,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mm_q6_k_f32_l4_lm;
     cl_kernel kernel_mul_mm_q4_k_f32_l4_lm = nullptr;
     cl_kernel kernel_mul_mm_q4_k_f32_l4_lm_packed = nullptr;
-    cl_kernel kernel_mul_mm_q4_k_f32_l4_lm_qst    = nullptr;
+    cl_kernel kernel_mul_mm_q4_k_f32_l4_lm_qst     = nullptr;
+    cl_kernel kernel_mul_mm_q4_k_f32_l4_lm_qst_n32 = nullptr;
 
     std::vector<ProfilingInfo> profiling_info;
 
@@ -1901,6 +1902,22 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
             build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src_q4k_qst.c_str(), compile_opts);
         CL_CHECK((backend_ctx->kernel_mul_mm_q4_k_f32_l4_lm_qst = clCreateKernel(prog_q4k_qst, "kernel_mul_mm_q4_k_f32_l4_lm_qst", &err), err));
         CL_CHECK(clReleaseProgram(prog_q4k_qst));
+        GGML_LOG_CONT(".");
+    }
+
+    // mul_mm_q4_k_f32_l4_lm_qst_n32 (narrow-N=32 qst GEMM for PP32..63 on Apple M1)
+    {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src_q4k_qst_n32 {
+            #include "mul_mm_q4_k_f32_l4_lm_qst_n32.cl.h"
+        };
+#else
+        const std::string kernel_src_q4k_qst_n32 = read_file("mul_mm_q4_k_f32_l4_lm_qst_n32.cl");
+#endif
+        cl_program prog_q4k_qst_n32 =
+            build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src_q4k_qst_n32.c_str(), compile_opts);
+        CL_CHECK((backend_ctx->kernel_mul_mm_q4_k_f32_l4_lm_qst_n32 = clCreateKernel(prog_q4k_qst_n32, "kernel_mul_mm_q4_k_f32_l4_lm_qst_n32", &err), err));
+        CL_CHECK(clReleaseProgram(prog_q4k_qst_n32));
         GGML_LOG_CONT(".");
     }
 
@@ -12034,12 +12051,42 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 
                     // Non-NVIDIA (Apple M1 etc.): prefer qst kernel (coalesced qs access),
                     // fall back to packed GEMM if qs_t buffer was not created (OOM).
+                    // For 32 ≤ ne11 < 64, use the narrow BN=32 variant to avoid half-empty tiles.
                     auto & qst_map = ((ggml_backend_opencl_buffer_context*)src0->buffer->context)->q4k_qs_t_buffers;
                     const bool have_qst = src0->buffer != nullptr && qst_map.count(src0) > 0;
+                    const bool use_n32  = have_qst && ne11 < 64;  // BN=32 path for PP32..63
 
                     int nth0_q4k = 128;
                     int batch_stride_b = ne10 * ne11;
                     int batch_stride_d = ne0 * ne1;
+
+                    // BN=32 path: tile N width = 32
+                    if (use_n32) {
+                        cl_kernel kq = backend_ctx->kernel_mul_mm_q4_k_f32_l4_lm_qst_n32;
+                        cl_mem qs_t  = qst_map.at(src0);
+                        size_t gws[] = {(size_t)(CEIL_DIV(ne01, 64)*nth0_q4k), (size_t)(CEIL_DIV(ne11, 32)), (size_t)ne12*ne13};
+                        size_t lws[] = {(size_t)nth0_q4k, 1, 1};
+                        CL_CHECK(clSetKernelArg(kq,  0, sizeof(cl_mem),   &extra0->data_device));
+                        CL_CHECK(clSetKernelArg(kq,  1, sizeof(cl_ulong), &offset0));
+                        CL_CHECK(clSetKernelArg(kq,  2, sizeof(cl_mem),   &qs_t));
+                        CL_CHECK(clSetKernelArg(kq,  3, sizeof(cl_mem),   &extra1->data_device));
+                        CL_CHECK(clSetKernelArg(kq,  4, sizeof(cl_ulong), &offset1));
+                        CL_CHECK(clSetKernelArg(kq,  5, sizeof(cl_mem),   &extrad->data_device));
+                        CL_CHECK(clSetKernelArg(kq,  6, sizeof(cl_ulong), &offsetd));
+                        CL_CHECK(clSetKernelArg(kq,  7, sizeof(int),      &ne00));
+                        CL_CHECK(clSetKernelArg(kq,  8, sizeof(int),      &ne01));
+                        CL_CHECK(clSetKernelArg(kq,  9, sizeof(int),      &ne02));
+                        CL_CHECK(clSetKernelArg(kq, 10, sizeof(int),      &ne11));
+                        CL_CHECK(clSetKernelArg(kq, 11, sizeof(int),      &ne12));
+                        CL_CHECK(clSetKernelArg(kq, 12, sizeof(int),      &ne10));
+                        CL_CHECK(clSetKernelArg(kq, 13, sizeof(int),      &ne01));
+                        CL_CHECK(clSetKernelArg(kq, 14, sizeof(int),      &batch_stride_b));
+                        CL_CHECK(clSetKernelArg(kq, 15, sizeof(int),      &batch_stride_d));
+                        CL_CHECK(clSetKernelArg(kq, 16, sizeof(int),      &r2));
+                        CL_CHECK(clSetKernelArg(kq, 17, sizeof(int),      &r3));
+                        backend_ctx->enqueue_ndrange_kernel(kq, 3, gws, lws, dst);
+                        return;
+                    }
 
                     size_t gws[] = {(size_t)(CEIL_DIV(ne01, 64)*nth0_q4k), (size_t)(CEIL_DIV(ne11, 64)), (size_t)ne12*ne13};
                     size_t lws[] = {(size_t)nth0_q4k, 1, 1};
