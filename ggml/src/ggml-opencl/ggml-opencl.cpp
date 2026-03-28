@@ -12671,9 +12671,6 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 ndst = 4;
             } else if (backend_ctx->gpu_family == INTEL) {
                 // nth0=16 for both true Intel and Apple M1 compat mode.
-                // In compat mode the kernel overrides BLOCK_STRIDE to 2 so
-                // that ix ∈ {0,1} (lid/8 with 16 threads) covers all
-                // super-blocks, and uses lm[N_DST*16] for the tree-reduction.
                 nth0 = 16;
                 nth1 = 1;
                 ndst = 4;
