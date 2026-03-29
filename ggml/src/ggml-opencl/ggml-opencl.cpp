@@ -572,12 +572,16 @@ struct ggml_backend_opencl_context {
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32;
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_q1;
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_f16;
+    std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_f16_split; // N_SPLIT>1 variant
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_f16_q1;
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_kv_pad_f16;
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_mask_pad_f16;
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_blk_f16;
     std::map<std::pair<int, int>, int>       kernels_flash_attn_f32_f16_bm;
     std::map<std::pair<int, int>, int>       kernels_flash_attn_f32_f16_bn;
+    std::map<std::pair<int, int>, int>       kernels_flash_attn_f32_f16_wg_size;
+    std::map<std::pair<int, int>, int>       kernels_flash_attn_f32_f16_split_wg_size;
+    std::map<std::pair<int, int>, int>       kernels_flash_attn_f32_f16_split_nkv_threshold;
     std::map<std::pair<int, int>, int>       kernels_flash_attn_bm;
     std::map<std::pair<int, int>, int>       kernels_flash_attn_bn;
     cl_kernel kernel_get_rows_f32, kernel_get_rows_f16, kernel_get_rows_q4_0;
@@ -2152,22 +2156,35 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
         #endif
 
         if (!kernel_src_f16.empty() && !kernel_src_f32.empty() && !kernel_src_f32_f16.empty() && !kernel_src_pre_f16.empty()) {
-            struct fa_dim { int dk; int dv; int bm; int bn; };
+            // n_split: number of threads collaborating on each query's dot product.
+            // When n_split > 1 a second "split" variant is compiled; the dispatch
+            // chooses between the two based on n_kv vs nkv_split_threshold.
+            // n_split>1 reduces register pressure for large DK at the cost of extra
+            // barriers — only beneficial when n_kv is large enough to amortise them.
+            struct fa_dim { int dk; int dv; int bm; int bn; int n_split; int nkv_split_threshold; };
 
             const fa_dim fa_dims_default[] = {
-                { 40,  40, 32, 32}, { 64,  64, 32, 32}, { 80,  80, 32, 32}, { 96,  96, 32, 32},
-                {112, 112, 32, 32}, {128, 128, 32, 32}, {192, 128, 16, 16},
-                {192, 192, 16, 16}, {256, 256, 16, 16},
+                { 40,  40, 32, 32, 1, 0}, { 64,  64, 32, 32, 1, 0}, { 80,  80, 32, 32, 1, 0}, { 96,  96, 32, 32, 1, 0},
+                {112, 112, 32, 32, 1, 0}, {128, 128, 32, 32, 1, 0}, {192, 128, 16, 16, 1, 0},
+                {192, 192, 16, 16, 1, 0},
+                // DK=256: N_SPLIT=8 reduces register pressure from 512 to 64 floats/thread.
+                // WG_SIZE = BLOCK_M * N_SPLIT = 16 * 8 = 128.
+                // Barrier overhead dominates at short n_kv; use split kernel only when
+                // n_kv >= 2048 (empirically determined on Apple M1).
+                {256, 256, 16, 16, 8, 2048},
             };
             const size_t fa_dims_count = sizeof(fa_dims_default)/sizeof(fa_dims_default[0]);
 
             for (size_t i = 0; i < fa_dims_count; ++i) {
-                const int dk = fa_dims_default[i].dk;
-                const int dv = fa_dims_default[i].dv;
-                const int bm = fa_dims_default[i].bm;
-                const int bn = fa_dims_default[i].bn;
-                const int bm_mixed = fa_dims_default[i].bm;
-                const int bn_mixed = fa_dims_default[i].bn;
+                const int dk                  = fa_dims_default[i].dk;
+                const int dv                  = fa_dims_default[i].dv;
+                const int bm                  = fa_dims_default[i].bm;
+                const int bn                  = fa_dims_default[i].bn;
+                const int n_split             = fa_dims_default[i].n_split;
+                const int nkv_split_threshold = fa_dims_default[i].nkv_split_threshold;
+                const int bm_mixed            = fa_dims_default[i].bm;
+                const int bn_mixed            = fa_dims_default[i].bn;
+                const int wg_size_mixed       = bm_mixed; // baseline: N_SPLIT=1
                 std::string OPTS = compile_opts +
                     " -D DK=" + std::to_string(dk) +
                     " -D DV=" + std::to_string(dv) +
@@ -2213,10 +2230,31 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
                 backend_ctx->kernels_flash_attn_blk_f16[{dk, dv}] = k_blk_f16;
                 CL_CHECK(clReleaseProgram(prog_pre_f16));
 
-                backend_ctx->kernels_flash_attn_f32_f16_bm[{dk, dv}] = bm_mixed;
-                backend_ctx->kernels_flash_attn_f32_f16_bn[{dk, dv}] = bn_mixed;
+                backend_ctx->kernels_flash_attn_f32_f16_bm[{dk, dv}]      = bm_mixed;
+                backend_ctx->kernels_flash_attn_f32_f16_bn[{dk, dv}]      = bn_mixed;
+                backend_ctx->kernels_flash_attn_f32_f16_wg_size[{dk, dv}] = wg_size_mixed;
                 backend_ctx->kernels_flash_attn_bm[{dk, dv}] = bm;
                 backend_ctx->kernels_flash_attn_bn[{dk, dv}] = bn;
+
+                // Compile N_SPLIT>1 variant if needed for this dk/dv pair.
+                if (n_split > 1) {
+                    std::string OPTS_MIXED_SPLIT = compile_opts +
+                        " -D DK=" + std::to_string(dk) +
+                        " -D DV=" + std::to_string(dv) +
+                        " -D BLOCK_M=" + std::to_string(bm_mixed) +
+                        " -D BLOCK_N=" + std::to_string(bn_mixed) +
+                        " -D N_SPLIT=" + std::to_string(n_split);
+                    const int wg_size_split = bm_mixed * n_split;
+                    cl_program prog_f32_f16_split = build_program_from_source(
+                        backend_ctx->context, backend_ctx->device,
+                        kernel_src_f32_f16.c_str(), OPTS_MIXED_SPLIT);
+                    cl_kernel k_f32_f16_split;
+                    CL_CHECK((k_f32_f16_split = clCreateKernel(prog_f32_f16_split, "flash_attn_f32_f16", &err), err));
+                    backend_ctx->kernels_flash_attn_f32_f16_split[{dk, dv}]               = k_f32_f16_split;
+                    backend_ctx->kernels_flash_attn_f32_f16_split_wg_size[{dk, dv}]       = wg_size_split;
+                    backend_ctx->kernels_flash_attn_f32_f16_split_nkv_threshold[{dk, dv}] = nkv_split_threshold;
+                    CL_CHECK(clReleaseProgram(prog_f32_f16_split));
+                }
             }
             GGML_LOG_CONT(".");
         }
@@ -10054,6 +10092,17 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     const int block_n = is_mixed
         ? backend_ctx->kernels_flash_attn_f32_f16_bn.at(dk_dv)
         : backend_ctx->kernels_flash_attn_bn.at(dk_dv);
+    // For DK values that have a split variant (N_SPLIT>1), choose it only when
+    // n_kv is large enough to amortise the extra barrier overhead.
+    const bool use_split_kernel = (n_q > 1 && is_mixed &&
+        backend_ctx->kernels_flash_attn_f32_f16_split.count(dk_dv) > 0 &&
+        n_kv >= backend_ctx->kernels_flash_attn_f32_f16_split_nkv_threshold.at(dk_dv));
+    // wg_size: BLOCK_M for baseline kernel, BLOCK_M*N_SPLIT for split variant.
+    const int wg_size_fa = (n_q > 1 && is_mixed)
+        ? (use_split_kernel
+            ? backend_ctx->kernels_flash_attn_f32_f16_split_wg_size.at(dk_dv)
+            : backend_ctx->kernels_flash_attn_f32_f16_wg_size.at(dk_dv))
+        : block_m;
 
     ggml_tensor_extra_cl * extra_q = (ggml_tensor_extra_cl *)q->extra;
     ggml_tensor_extra_cl * extra_k = (ggml_tensor_extra_cl *)k->extra;
@@ -10097,7 +10146,9 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         }
     } else {
         if (is_mixed) {
-            kernel = backend_ctx->kernels_flash_attn_f32_f16.at(dk_dv);
+            kernel = use_split_kernel
+                ? backend_ctx->kernels_flash_attn_f32_f16_split.at(dk_dv)
+                : backend_ctx->kernels_flash_attn_f32_f16.at(dk_dv);
         } else if (is_f16) {
             kernel = backend_ctx->kernels_flash_attn_f16.at(dk_dv);
         } else {
@@ -10272,7 +10323,9 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         size_t global_work_size[] = { wg_size, (size_t)(n_head * n_batch) };
         backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, dst);
     } else {
-        const size_t wg_size = block_m;
+        // wg_size_fa = block_m * N_SPLIT for the split variant, block_m otherwise.
+        // global_work_size[0] = n_q_blocks * wg_size_fa; block_m is used for n_q_blocks.
+        const size_t wg_size = (size_t)wg_size_fa;
         size_t local_work_size[] = { wg_size, 1 };
         size_t global_work_size[] = { (size_t)((n_q + block_m - 1) / block_m) * wg_size, (size_t)(n_head * n_batch) };
         backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, dst);
