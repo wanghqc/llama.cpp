@@ -786,25 +786,15 @@ struct ggml_backend_opencl_context {
     }
 
     void enqueue_ndrange_kernel(cl_kernel kernel, cl_uint work_dim, size_t *global_work_size, size_t *local_work_size, const ggml_tensor * tensor) {
-        cl_int kernel_name_status = CL_SUCCESS;
-        size_t kernel_name_size = 0;
-        std::string kernel_name = "<unknown>";
-        kernel_name_status = clGetKernelInfo(kernel, CL_KERNEL_FUNCTION_NAME, 0, nullptr, &kernel_name_size);
-        if (kernel_name_status == CL_SUCCESS && kernel_name_size > 1) {
-            std::vector<char> kernel_name_buf(kernel_name_size);
-            kernel_name_status = clGetKernelInfo(kernel, CL_KERNEL_FUNCTION_NAME, kernel_name_size, kernel_name_buf.data(), nullptr);
-            if (kernel_name_status == CL_SUCCESS) {
-                kernel_name.assign(kernel_name_buf.data());
-            }
-        }
-
 #ifdef GGML_OPENCL_PROFILING
         cl_event evt;
         cl_int err = clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, &evt);
         if (err != CL_SUCCESS) {
+            char kernel_name[512] = "<unknown>";
+            clGetKernelInfo(kernel, CL_KERNEL_FUNCTION_NAME, sizeof(kernel_name), kernel_name, nullptr);
             GGML_LOG_ERROR("%s: enqueue failed for kernel '%s' (work_dim=%u, global=[%zu,%zu,%zu], local=%s[%zu,%zu,%zu], tensor=%s)\n",
                 __func__,
-                kernel_name.c_str(),
+                kernel_name,
                 work_dim,
                 global_work_size ? global_work_size[0] : 0,
                 global_work_size ? global_work_size[1] : 0,
@@ -823,9 +813,11 @@ struct ggml_backend_opencl_context {
         GGML_UNUSED(tensor);
         cl_int err = clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, NULL);
         if (err != CL_SUCCESS) {
+            char kernel_name[512] = "<unknown>";
+            clGetKernelInfo(kernel, CL_KERNEL_FUNCTION_NAME, sizeof(kernel_name), kernel_name, nullptr);
             GGML_LOG_ERROR("%s: enqueue failed for kernel '%s' (work_dim=%u, global=[%zu,%zu,%zu], local=%s[%zu,%zu,%zu])\n",
                 __func__,
-                kernel_name.c_str(),
+                kernel_name,
                 work_dim,
                 global_work_size ? global_work_size[0] : 0,
                 global_work_size ? global_work_size[1] : 0,
@@ -3889,9 +3881,9 @@ struct ggml_tensor_extra_cl_q4_0 {
     }
 
     void reset() {
-        // q and d are subbuffers into the bigger buffer allocated in ggml_backend_buffer.
-        // They must be properly released so that the original buffer can be
-        // properly released to avoid memory leak.
+        // d is a sub-buffer into the main pool; q is a sub-buffer on non-Adreno and a
+        // standalone buffer on Adreno (images backed by sub-buffers have degraded perf
+        // on Qualcomm). Both must be released to avoid memory leaks.
         if (q != nullptr) {
             CL_CHECK(clReleaseMemObject(q));
             q = nullptr;
@@ -5177,16 +5169,23 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         cl_int err;
         cl_buffer_region region;
 
-        // Sub-buffers: d at tensor's pool start, q immediately after.
+        // d is a sub-buffer at tensor's pool start.
+        // q: on Adreno the GEMV inference path wraps q in a CL_MEM_OBJECT_IMAGE1D_BUFFER; Qualcomm's
+        // driver has degraded performance for images backed by sub-buffers, so use a standalone buffer.
+        // On non-Adreno, q is a sub-buffer of the main pool (zero extra GPU allocation).
         region.origin = align_to(extra_orig->offset + tensor->view_offs + offset, backend_ctx->alignment);
         region.size   = size_d;
         extra->d = clCreateSubBuffer(extra_orig->data_device, CL_MEM_READ_WRITE,
                                      CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
         CL_CHECK(err);
-        region.origin = align_to(region.origin + size_d, backend_ctx->alignment);
-        region.size   = size_q;
-        extra->q = clCreateSubBuffer(extra_orig->data_device, CL_MEM_READ_WRITE,
-                                     CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
+        if (backend_ctx->gpu_family == GPU_FAMILY::ADRENO) {
+            extra->q = clCreateBuffer(context, CL_MEM_READ_WRITE, size_q, NULL, &err);
+        } else {
+            region.origin = align_to(region.origin + size_d, backend_ctx->alignment);
+            region.size   = size_q;
+            extra->q = clCreateSubBuffer(extra_orig->data_device, CL_MEM_READ_WRITE,
+                                         CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
+        }
         CL_CHECK(err);
 
         // Build SOA data in CPU buffers.
@@ -8842,10 +8841,12 @@ static void ggml_opencl_op_rms_norm_fused(ggml_backend_t backend, ggml_tensor * 
     CL_CHECK(clSetKernelArg(kernel, 21, sizeof(cl_ulong),      &nb2));
     CL_CHECK(clSetKernelArg(kernel, 22, sizeof(cl_ulong),      &nb3));
     CL_CHECK(clSetKernelArg(kernel, 23, sizeof(float),         &eps));
-    // NVIDIA uses __local tree reduction over nth elements; non-NVIDIA uses
-    // sub-group reduction over at most nth/sgs elements.  Allocate nth floats
-    // so both paths have enough room.
-    CL_CHECK(clSetKernelArg(kernel, 24, sizeof(float)*nth,     NULL));
+    // NVIDIA uses __local tree reduction over nth elements (sum[0..nth-1]).
+    // Adreno/Intel uses sub-group reduction and only accesses sum[0..sgs-1].
+    // Allocating nth floats for non-NVIDIA wastes local memory (8x on Adreno
+    // when nth=512, sgs=64) and reduces occupancy; use sgs for those paths.
+    const size_t local_sum_floats = ggml_opencl_uses_local_subgroup_compat(backend_ctx) ? (size_t)nth : (size_t)sgs;
+    CL_CHECK(clSetKernelArg(kernel, 24, sizeof(float)*local_sum_floats, NULL));
 
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 }
