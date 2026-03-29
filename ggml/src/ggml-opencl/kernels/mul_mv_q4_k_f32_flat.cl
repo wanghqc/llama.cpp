@@ -43,15 +43,19 @@
 // covering the full block in 2 cache lines.  The interleaved layout (old ix = lid%4
 // for Adreno) caused 128-byte strides between consecutive threads, preventing coalescing.
 //
-//   ip  = tid / 8  (0..1)   first or second 64-byte qs section
-//   il  = tid % 8  (0..7)   8-byte segment within section
-//   sg_lo = 4*ip + 2*(il/4)   scale-group for lo nibbles (0,2,4,6)
-//   sg_hi = sg_lo + 1          scale-group for hi nibbles (1,3,5,7)
-//   q_off    = 64*ip + 8*il   byte offset into qs[0..127]
-//   y_lo_off = 32*sg_lo + 8*(il&3)
+//   ip      = tid / 8  (0..1)     first or second 64-byte qs section
+//   il      = tid % 8  (0..7)     8-byte segment within section
+//   sc_pair = il >> 2  (0..1)     which pair of scale-groups (il=0..3 → 0, il=4..7 → 1)
+//   q_off    = 64*ip + 8*il       byte offset into qs[0..127]
+//   y_lo_off = 128*ip + 64*sc_pair + 8*(il&3)
 //   y_hi_off = y_lo_off + 32
 //
-// Scale decode follows get_scale_min_k4 from ggml-quants.c.
+// Scale decode: 3 aligned ushort reads + pure arithmetic, no divergent memory access.
+// The 12-byte scale block is read as 3 ushorts at byte offsets {0,4,8} (sc_pair=0) or
+// {2,6,10} (sc_pair=1), giving bytes A={0,1}, B={4,5}, C={8,9} (or {2,3},{6,7},{10,11}).
+//   ip=0: scale = A & 63,         smin = B & 63
+//   ip=1: scale = (C&0x0F)|((A&0xC0)>>2),  smin = (C>>4)|((B&0xC0)>>2)
+// This matches get_scale_min_k4 from ggml-quants.c for all 8 scale groups.
 
 #define QK_K         256
 #define K_SCALE_SIZE 12
@@ -130,22 +134,15 @@ kernel void kernel_mul_mv_q4_K_f32_flat(
     int ix  = lid / 16;            // 0..BLOCK_STRIDE-1: which super-block per iter
     int tid = lid % 16;            // 0..15: role within a super-block
 
-    int ip  = tid / 8;             // 0 or 1 (which 64-byte qs section)
-    int il  = tid % 8;             // 0..7  (8-byte segment within section)
-
-    // Scale groups for lo and hi nibbles of this thread's 8 qs bytes.
-    int sg_lo = 4*ip + 2*(il/4);  // in {0,2,4,6}
-    int sg_hi = sg_lo + 1;        // in {1,3,5,7}
-    // Clamped versions for safe speculative evaluation in ternary false-branch
-    // (GPU evaluates both branches; negative index -> page fault).
-    int sg_lo_m4 = max(sg_lo - 4, 0);  // safe substitute for sg_lo-4
-    int sg_hi_m4 = max(sg_hi - 4, 0);  // safe substitute for sg_hi-4
+    int ip      = tid / 8;         // 0 or 1 (which 64-byte qs section)
+    int il      = tid % 8;         // 0..7  (8-byte segment within section)
+    int sc_pair = il >> 2;         // 0 for il=0..3, 1 for il=4..7
 
     // Byte offset into qs[0..127] for this thread's 8 bytes.
     int q_off = 64*ip + 8*il;
 
-    // Y element offsets.
-    int y_lo_off = 32*sg_lo + 8*(il & 3);
+    // Y element offsets (equivalent to 32*sg_lo + 8*(il&3) with sg_lo = 4*ip + 2*sc_pair).
+    int y_lo_off = 128*ip + 64*sc_pair + 8*(il & 3);
     int y_hi_off = y_lo_off + 32;
 
     float4 sumf = (float4)(0.f);
@@ -169,15 +166,16 @@ kernel void kernel_mul_mv_q4_K_f32_flat(
                           + dot(ylo1, convert_float4(qb & (uchar4)0x0F));
             float dotq_hi = dot(yhi0, convert_float4(qa >> (uchar)4))
                           + dot(yhi1, convert_float4(qb >> (uchar)4));
-            global uchar * sc = src0_scales + bi*(ulong)K_SCALE_SIZE;
-            float scale_lo = sg_lo < 4 ? (float)(sc[sg_lo]   & 63)
-                                       : (float)((sc[sg_lo+4] & 0x0F) | ((sc[sg_lo_m4] >> 6) << 4));
-            float scale_hi = sg_hi < 4 ? (float)(sc[sg_hi]   & 63)
-                                       : (float)((sc[sg_hi+4] & 0x0F) | ((sc[sg_hi_m4] >> 6) << 4));
-            float smin_lo  = sg_lo < 4 ? (float)(sc[sg_lo+4] & 63)
-                                       : (float)((sc[sg_lo+4] >>    4) | ((sc[sg_lo  ] >> 6) << 4));
-            float smin_hi  = sg_hi < 4 ? (float)(sc[sg_hi+4] & 63)
-                                       : (float)((sc[sg_hi+4] >>    4) | ((sc[sg_hi  ] >> 6) << 4));
+            // 3 aligned ushort reads cover the 6 bytes needed for this sc_pair.
+            // No divergent memory access: all 4 reads unconditional, select is pure arithmetic.
+            global ushort * sc_u = (global ushort *)(src0_scales + bi*(ulong)K_SCALE_SIZE) + sc_pair;
+            uchar A_lo = (uchar)(sc_u[0]),     A_hi = (uchar)(sc_u[0] >> 8);
+            uchar B_lo = (uchar)(sc_u[2]),     B_hi = (uchar)(sc_u[2] >> 8);
+            uchar C_lo = (uchar)(sc_u[4]),     C_hi = (uchar)(sc_u[4] >> 8);
+            float scale_lo = ip==0 ? (float)(A_lo & 63) : (float)((C_lo & 0x0F) | ((A_lo & 0xC0) >> 2));
+            float scale_hi = ip==0 ? (float)(A_hi & 63) : (float)((C_hi & 0x0F) | ((A_hi & 0xC0) >> 2));
+            float smin_lo  = ip==0 ? (float)(B_lo & 63) : (float)((C_lo  >>  4) | ((B_lo & 0xC0) >> 2));
+            float smin_hi  = ip==0 ? (float)(B_hi & 63) : (float)((C_hi  >>  4) | ((B_hi & 0xC0) >> 2));
             sumf.s0 += vload_half(0, src0_d    + bi) * (scale_lo * dotq_lo + scale_hi * dotq_hi)
                      - vload_half(0, src0_dmin  + bi) * (smin_lo  * sumy_lo + smin_hi  * sumy_hi);
         }
@@ -189,15 +187,16 @@ kernel void kernel_mul_mv_q4_K_f32_flat(
                           + dot(ylo1, convert_float4(qb & (uchar4)0x0F));
             float dotq_hi = dot(yhi0, convert_float4(qa >> (uchar)4))
                           + dot(yhi1, convert_float4(qb >> (uchar)4));
-            global uchar * sc = src0_scales + bi*(ulong)K_SCALE_SIZE;
-            float scale_lo = sg_lo < 4 ? (float)(sc[sg_lo]   & 63)
-                                       : (float)((sc[sg_lo+4] & 0x0F) | ((sc[sg_lo_m4] >> 6) << 4));
-            float scale_hi = sg_hi < 4 ? (float)(sc[sg_hi]   & 63)
-                                       : (float)((sc[sg_hi+4] & 0x0F) | ((sc[sg_hi_m4] >> 6) << 4));
-            float smin_lo  = sg_lo < 4 ? (float)(sc[sg_lo+4] & 63)
-                                       : (float)((sc[sg_lo+4] >>    4) | ((sc[sg_lo  ] >> 6) << 4));
-            float smin_hi  = sg_hi < 4 ? (float)(sc[sg_hi+4] & 63)
-                                       : (float)((sc[sg_hi+4] >>    4) | ((sc[sg_hi  ] >> 6) << 4));
+            // 3 aligned ushort reads cover the 6 bytes needed for this sc_pair.
+            // No divergent memory access: all 4 reads unconditional, select is pure arithmetic.
+            global ushort * sc_u = (global ushort *)(src0_scales + bi*(ulong)K_SCALE_SIZE) + sc_pair;
+            uchar A_lo = (uchar)(sc_u[0]),     A_hi = (uchar)(sc_u[0] >> 8);
+            uchar B_lo = (uchar)(sc_u[2]),     B_hi = (uchar)(sc_u[2] >> 8);
+            uchar C_lo = (uchar)(sc_u[4]),     C_hi = (uchar)(sc_u[4] >> 8);
+            float scale_lo = ip==0 ? (float)(A_lo & 63) : (float)((C_lo & 0x0F) | ((A_lo & 0xC0) >> 2));
+            float scale_hi = ip==0 ? (float)(A_hi & 63) : (float)((C_hi & 0x0F) | ((A_hi & 0xC0) >> 2));
+            float smin_lo  = ip==0 ? (float)(B_lo & 63) : (float)((C_lo  >>  4) | ((B_lo & 0xC0) >> 2));
+            float smin_hi  = ip==0 ? (float)(B_hi & 63) : (float)((C_hi  >>  4) | ((B_hi & 0xC0) >> 2));
             sumf.s1 += vload_half(0, src0_d    + bi) * (scale_lo * dotq_lo + scale_hi * dotq_hi)
                      - vload_half(0, src0_dmin  + bi) * (smin_lo  * sumy_lo + smin_hi  * sumy_hi);
         }
@@ -209,15 +208,16 @@ kernel void kernel_mul_mv_q4_K_f32_flat(
                           + dot(ylo1, convert_float4(qb & (uchar4)0x0F));
             float dotq_hi = dot(yhi0, convert_float4(qa >> (uchar)4))
                           + dot(yhi1, convert_float4(qb >> (uchar)4));
-            global uchar * sc = src0_scales + bi*(ulong)K_SCALE_SIZE;
-            float scale_lo = sg_lo < 4 ? (float)(sc[sg_lo]   & 63)
-                                       : (float)((sc[sg_lo+4] & 0x0F) | ((sc[sg_lo_m4] >> 6) << 4));
-            float scale_hi = sg_hi < 4 ? (float)(sc[sg_hi]   & 63)
-                                       : (float)((sc[sg_hi+4] & 0x0F) | ((sc[sg_hi_m4] >> 6) << 4));
-            float smin_lo  = sg_lo < 4 ? (float)(sc[sg_lo+4] & 63)
-                                       : (float)((sc[sg_lo+4] >>    4) | ((sc[sg_lo  ] >> 6) << 4));
-            float smin_hi  = sg_hi < 4 ? (float)(sc[sg_hi+4] & 63)
-                                       : (float)((sc[sg_hi+4] >>    4) | ((sc[sg_hi  ] >> 6) << 4));
+            // 3 aligned ushort reads cover the 6 bytes needed for this sc_pair.
+            // No divergent memory access: all 4 reads unconditional, select is pure arithmetic.
+            global ushort * sc_u = (global ushort *)(src0_scales + bi*(ulong)K_SCALE_SIZE) + sc_pair;
+            uchar A_lo = (uchar)(sc_u[0]),     A_hi = (uchar)(sc_u[0] >> 8);
+            uchar B_lo = (uchar)(sc_u[2]),     B_hi = (uchar)(sc_u[2] >> 8);
+            uchar C_lo = (uchar)(sc_u[4]),     C_hi = (uchar)(sc_u[4] >> 8);
+            float scale_lo = ip==0 ? (float)(A_lo & 63) : (float)((C_lo & 0x0F) | ((A_lo & 0xC0) >> 2));
+            float scale_hi = ip==0 ? (float)(A_hi & 63) : (float)((C_hi & 0x0F) | ((A_hi & 0xC0) >> 2));
+            float smin_lo  = ip==0 ? (float)(B_lo & 63) : (float)((C_lo  >>  4) | ((B_lo & 0xC0) >> 2));
+            float smin_hi  = ip==0 ? (float)(B_hi & 63) : (float)((C_hi  >>  4) | ((B_hi & 0xC0) >> 2));
             sumf.s2 += vload_half(0, src0_d    + bi) * (scale_lo * dotq_lo + scale_hi * dotq_hi)
                      - vload_half(0, src0_dmin  + bi) * (smin_lo  * sumy_lo + smin_hi  * sumy_hi);
         }
@@ -229,15 +229,16 @@ kernel void kernel_mul_mv_q4_K_f32_flat(
                           + dot(ylo1, convert_float4(qb & (uchar4)0x0F));
             float dotq_hi = dot(yhi0, convert_float4(qa >> (uchar)4))
                           + dot(yhi1, convert_float4(qb >> (uchar)4));
-            global uchar * sc = src0_scales + bi*(ulong)K_SCALE_SIZE;
-            float scale_lo = sg_lo < 4 ? (float)(sc[sg_lo]   & 63)
-                                       : (float)((sc[sg_lo+4] & 0x0F) | ((sc[sg_lo_m4] >> 6) << 4));
-            float scale_hi = sg_hi < 4 ? (float)(sc[sg_hi]   & 63)
-                                       : (float)((sc[sg_hi+4] & 0x0F) | ((sc[sg_hi_m4] >> 6) << 4));
-            float smin_lo  = sg_lo < 4 ? (float)(sc[sg_lo+4] & 63)
-                                       : (float)((sc[sg_lo+4] >>    4) | ((sc[sg_lo  ] >> 6) << 4));
-            float smin_hi  = sg_hi < 4 ? (float)(sc[sg_hi+4] & 63)
-                                       : (float)((sc[sg_hi+4] >>    4) | ((sc[sg_hi  ] >> 6) << 4));
+            // 3 aligned ushort reads cover the 6 bytes needed for this sc_pair.
+            // No divergent memory access: all 4 reads unconditional, select is pure arithmetic.
+            global ushort * sc_u = (global ushort *)(src0_scales + bi*(ulong)K_SCALE_SIZE) + sc_pair;
+            uchar A_lo = (uchar)(sc_u[0]),     A_hi = (uchar)(sc_u[0] >> 8);
+            uchar B_lo = (uchar)(sc_u[2]),     B_hi = (uchar)(sc_u[2] >> 8);
+            uchar C_lo = (uchar)(sc_u[4]),     C_hi = (uchar)(sc_u[4] >> 8);
+            float scale_lo = ip==0 ? (float)(A_lo & 63) : (float)((C_lo & 0x0F) | ((A_lo & 0xC0) >> 2));
+            float scale_hi = ip==0 ? (float)(A_hi & 63) : (float)((C_hi & 0x0F) | ((A_hi & 0xC0) >> 2));
+            float smin_lo  = ip==0 ? (float)(B_lo & 63) : (float)((C_lo  >>  4) | ((B_lo & 0xC0) >> 2));
+            float smin_hi  = ip==0 ? (float)(B_hi & 63) : (float)((C_hi  >>  4) | ((B_hi & 0xC0) >> 2));
             sumf.s3 += vload_half(0, src0_d    + bi) * (scale_lo * dotq_lo + scale_hi * dotq_hi)
                      - vload_half(0, src0_dmin  + bi) * (smin_lo  * sumy_lo + smin_hi  * sumy_hi);
         }
