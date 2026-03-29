@@ -97,9 +97,14 @@ static fastdiv_vals init_fastdiv_values(uint64_t d_64) {
 
 enum GPU_FAMILY {
     ADRENO,
+    APPLE,
     INTEL,
     UNKNOWN,
 };
+
+static inline bool ggml_cl_gpu_family_is_intel_like(GPU_FAMILY gpu_family) {
+    return gpu_family == INTEL || gpu_family == APPLE;
+}
 
 enum ADRENO_GPU_GEN {
     ADRENO_UNKNOWN,
@@ -429,6 +434,7 @@ struct ggml_backend_opencl_context {
     cl_int alignment;
     size_t max_alloc_size;
     size_t max_workgroup_size;
+    cl_ulong local_mem_size;
     bool fp16_support;
     bool has_vector_subgroup_broadcast;
     bool disable_fusion;
@@ -557,6 +563,11 @@ struct ggml_backend_opencl_context {
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_q1;
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_f16;
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_f16_q1;
+    std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_kv_pad_f16;
+    std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_mask_pad_f16;
+    std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_blk_f16;
+    std::map<std::pair<int, int>, int>       kernels_flash_attn_f32_f16_bm;
+    std::map<std::pair<int, int>, int>       kernels_flash_attn_f32_f16_bn;
     std::map<std::pair<int, int>, int>       kernels_flash_attn_bm;
     std::map<std::pair<int, int>, int>       kernels_flash_attn_bn;
     cl_kernel kernel_get_rows_f32, kernel_get_rows_f16, kernel_get_rows_q4_0;
@@ -2162,29 +2173,43 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
                 const std::string kernel_src_f32_f16 {
                     #include "flash_attn_f32_f16.cl.h"
                 };
+                const std::string kernel_src_pre_f16 {
+                    #include "flash_attn_pre_f16.cl.h"
+                };
         #else
                 const std::string kernel_src_f16 = read_file("flash_attn_f16.cl");
                 const std::string kernel_src_f32 = read_file("flash_attn_f32.cl");
                 const std::string kernel_src_f32_f16 = read_file("flash_attn_f32_f16.cl");
+                const std::string kernel_src_pre_f16 = read_file("flash_attn_pre_f16.cl");
         #endif
 
-        if (!kernel_src_f16.empty() && !kernel_src_f32.empty() && !kernel_src_f32_f16.empty()) {
-            const struct { int dk; int dv; int bm; int bn; } fa_dims[] = {
+        if (!kernel_src_f16.empty() && !kernel_src_f32.empty() && !kernel_src_f32_f16.empty() && !kernel_src_pre_f16.empty()) {
+            struct fa_dim { int dk; int dv; int bm; int bn; };
+
+            const fa_dim fa_dims_default[] = {
                 { 40,  40, 32, 32}, { 64,  64, 32, 32}, { 80,  80, 32, 32}, { 96,  96, 32, 32},
                 {112, 112, 32, 32}, {128, 128, 32, 32}, {192, 128, 16, 16},
                 {192, 192, 16, 16}, {256, 256, 16, 16},
             };
+            const size_t fa_dims_count = sizeof(fa_dims_default)/sizeof(fa_dims_default[0]);
 
-            for (size_t i = 0; i < sizeof(fa_dims)/sizeof(fa_dims[0]); ++i) {
-                const int dk = fa_dims[i].dk;
-                const int dv = fa_dims[i].dv;
-                const int bm = fa_dims[i].bm;
-                const int bn = fa_dims[i].bn;
+            for (size_t i = 0; i < fa_dims_count; ++i) {
+                const int dk = fa_dims_default[i].dk;
+                const int dv = fa_dims_default[i].dv;
+                const int bm = fa_dims_default[i].bm;
+                const int bn = fa_dims_default[i].bn;
+                const int bm_mixed = fa_dims_default[i].bm;
+                const int bn_mixed = fa_dims_default[i].bn;
                 std::string OPTS = compile_opts +
                     " -D DK=" + std::to_string(dk) +
                     " -D DV=" + std::to_string(dv) +
                     " -D BLOCK_M=" + std::to_string(bm) +
                     " -D BLOCK_N=" + std::to_string(bn);
+                std::string OPTS_MIXED = compile_opts +
+                    " -D DK=" + std::to_string(dk) +
+                    " -D DV=" + std::to_string(dv) +
+                    " -D BLOCK_M=" + std::to_string(bm_mixed) +
+                    " -D BLOCK_N=" + std::to_string(bn_mixed);
 
                 cl_program prog_f16 = build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src_f16.c_str(), OPTS);
                 cl_kernel k_f16, k_f16_q1;
@@ -2202,7 +2227,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
                 backend_ctx->kernels_flash_attn_f32_q1[{dk, dv}] = k_f32_q1;
                 CL_CHECK(clReleaseProgram(prog_f32));
 
-                cl_program prog_f32_f16 = build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src_f32_f16.c_str(), OPTS);
+                cl_program prog_f32_f16 = build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src_f32_f16.c_str(), OPTS_MIXED);
                 cl_kernel k_f32_f16, k_f32_f16_q1;
                 CL_CHECK((k_f32_f16 = clCreateKernel(prog_f32_f16, "flash_attn_f32_f16", &err), err));
                 CL_CHECK((k_f32_f16_q1 = clCreateKernel(prog_f32_f16, "flash_attn_f32_f16_q1", &err), err));
@@ -2210,6 +2235,18 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
                 backend_ctx->kernels_flash_attn_f32_f16_q1[{dk, dv}] = k_f32_f16_q1;
                 CL_CHECK(clReleaseProgram(prog_f32_f16));
 
+                cl_program prog_pre_f16 = build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src_pre_f16.c_str(), OPTS_MIXED);
+                cl_kernel k_kv_pad_f16, k_mask_pad_f16, k_blk_f16;
+                CL_CHECK((k_kv_pad_f16 = clCreateKernel(prog_pre_f16, "flash_attn_kv_pad_f16", &err), err));
+                CL_CHECK((k_mask_pad_f16 = clCreateKernel(prog_pre_f16, "flash_attn_mask_pad_f16", &err), err));
+                CL_CHECK((k_blk_f16 = clCreateKernel(prog_pre_f16, "flash_attn_blk_f16", &err), err));
+                backend_ctx->kernels_flash_attn_kv_pad_f16[{dk, dv}] = k_kv_pad_f16;
+                backend_ctx->kernels_flash_attn_mask_pad_f16[{dk, dv}] = k_mask_pad_f16;
+                backend_ctx->kernels_flash_attn_blk_f16[{dk, dv}] = k_blk_f16;
+                CL_CHECK(clReleaseProgram(prog_pre_f16));
+
+                backend_ctx->kernels_flash_attn_f32_f16_bm[{dk, dv}] = bm_mixed;
+                backend_ctx->kernels_flash_attn_f32_f16_bn[{dk, dv}] = bn_mixed;
                 backend_ctx->kernels_flash_attn_bm[{dk, dv}] = bm;
                 backend_ctx->kernels_flash_attn_bn[{dk, dv}] = bn;
             }
@@ -3548,6 +3585,10 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
 
     clGetDeviceInfo(device, CL_DEVICE_MAX_MEM_ALLOC_SIZE, sizeof(size_t), &backend_ctx->max_alloc_size, NULL);
     GGML_LOG_INFO("ggml_opencl: max mem alloc size: %zu MB\n", backend_ctx->max_alloc_size/1024/1024);
+
+    clGetDeviceInfo(device, CL_DEVICE_LOCAL_MEM_SIZE, sizeof(cl_ulong), &backend_ctx->local_mem_size, NULL);
+    GGML_LOG_INFO("ggml_opencl: device local mem size: %llu KB\n",
+        (unsigned long long) backend_ctx->local_mem_size / 1024ull);
 
     clGetDeviceInfo(device, CL_DEVICE_IMAGE_MAX_BUFFER_SIZE, sizeof(size_t), &backend_ctx->image_max_buffer_size, NULL);
     GGML_LOG_INFO("ggml_opencl: device max image buffer size (pixels): %lu\n", backend_ctx->image_max_buffer_size);
@@ -7272,7 +7313,7 @@ static void ggml_cl_set_rows(ggml_backend_t backend, const ggml_tensor * src0, c
     CL_CHECK(clSetKernelArg(kernel, 18, sizeof(cl_ulong), &nb3));
 
     int nth0 = 64;
-    if (backend_ctx->gpu_family == INTEL) {
+    if (ggml_cl_gpu_family_is_intel_like(backend_ctx->gpu_family)) {
         nth0 = 32;
     } else if (backend_ctx->gpu_family == ADRENO) {
         nth0 = 64;
@@ -8695,13 +8736,8 @@ static void ggml_cl_rms_norm(ggml_backend_t backend, const ggml_tensor * src0, c
     //    CL_KERNEL_MAX_SUB_GROUP_SIZE_FOR_NDRANGE,
     //    sizeof(local_work_size), local_work_size,
     //    sizeof(size_t), &sgs, NULL));
-    if (backend_ctx->gpu_family == ADRENO) {
-        sgs = 64;
-    } else if (backend_ctx->gpu_family == INTEL) {
-        sgs = 32;
-    } else {
-        GGML_ASSERT(false && "Unsupported GPU");
-    }
+    GGML_ASSERT(backend_ctx->gpu_family != UNKNOWN);
+    sgs = backend_ctx->gpu_family == ADRENO ? 64 : 32;
 
     CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),    &extra0->data_device));
     CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong),  &offset0));
@@ -8782,13 +8818,8 @@ static void ggml_opencl_op_rms_norm_fused(ggml_backend_t backend, ggml_tensor * 
     GGML_ASSERT(ne00 % 4 == 0);
 
     size_t sgs;
-    if (backend_ctx->gpu_family == ADRENO) {
-        sgs = 64;
-    } else if (backend_ctx->gpu_family == INTEL) {
-        sgs = 32;
-    } else {
-        GGML_ASSERT(false && "Unsupported GPU");
-    }
+    GGML_ASSERT(backend_ctx->gpu_family != UNKNOWN);
+    sgs = backend_ctx->gpu_family == ADRENO ? 64 : 32;
 
     cl_kernel kernel = backend_ctx->kernel_rms_norm_mul;
 
@@ -8867,9 +8898,8 @@ static void ggml_opencl_op_norm_fused(ggml_backend_t backend, ggml_tensor * norm
     const cl_ulong nbd1 = dst->nb[1], nbd2 = dst->nb[2], nbd3 = dst->nb[3];
 
     size_t sgs;
-    if (backend_ctx->gpu_family == ADRENO) sgs = 64;
-    else if (backend_ctx->gpu_family == INTEL) sgs = 32;
-    else GGML_ASSERT(false && "Unsupported GPU");
+    GGML_ASSERT(backend_ctx->gpu_family != UNKNOWN);
+    sgs = backend_ctx->gpu_family == ADRENO ? 64 : 32;
 
     cl_kernel kernel = backend_ctx->kernel_norm_mul_add;
 
@@ -8997,13 +9027,8 @@ static void ggml_cl_group_norm(ggml_backend_t backend, const ggml_tensor * src0,
     cl_kernel kernel = backend_ctx->kernel_group_norm;
 
     size_t sgs = 64;
-    if (backend_ctx->gpu_family == ADRENO) {
-        sgs = 64;
-    } else if (backend_ctx->gpu_family == INTEL) {
-        sgs = 32;
-    } else {
-        GGML_ASSERT(false && "Unsupported GPU");
-    }
+    GGML_ASSERT(backend_ctx->gpu_family != UNKNOWN);
+    sgs = backend_ctx->gpu_family == ADRENO ? 64 : 32;
 
     CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &extra0->data_device));
     CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_ulong), &offset0));
@@ -9043,13 +9068,8 @@ static void ggml_cl_l2_norm(ggml_backend_t backend, const ggml_tensor * src0, co
     GGML_TENSOR_LOCALS(cl_ulong, db,  dst,  nb);
 
     size_t sgs;
-    if (backend_ctx->gpu_family == ADRENO) {
-        sgs = 64;
-    } else if (backend_ctx->gpu_family == INTEL) {
-        sgs = 32;
-    } else {
-        GGML_ASSERT(false && "Unsupported GPU");
-    }
+    GGML_ASSERT(backend_ctx->gpu_family != UNKNOWN);
+    sgs = backend_ctx->gpu_family == ADRENO ? 64 : 32;
 
     cl_kernel kernel = backend_ctx->kernel_l2_norm_f32;
 
@@ -10043,25 +10063,12 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     const bool is_f16 = q->type == GGML_TYPE_F16;
     const bool is_mixed = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16;
     const std::pair<int, int> dk_dv = {d_head_q, d_head_v};
-
-    if (n_q == 1) {
-        if (is_mixed) {
-            kernel = backend_ctx->kernels_flash_attn_f32_f16_q1.at(dk_dv);
-        } else if (is_f16) {
-            kernel = backend_ctx->kernels_flash_attn_f16_q1.at(dk_dv);
-        } else {
-            kernel = backend_ctx->kernels_flash_attn_f32_q1.at(dk_dv);
-        }
-    } else {
-        if (is_mixed) {
-            kernel = backend_ctx->kernels_flash_attn_f32_f16.at(dk_dv);
-        } else if (is_f16) {
-            kernel = backend_ctx->kernels_flash_attn_f16.at(dk_dv);
-        } else {
-            kernel = backend_ctx->kernels_flash_attn_f32.at(dk_dv);
-        }
-    }
-    GGML_ASSERT(kernel != NULL);
+    const int block_m = n_q > 1
+        ? (is_mixed ? backend_ctx->kernels_flash_attn_f32_f16_bm.at(dk_dv) : backend_ctx->kernels_flash_attn_bm.at(dk_dv))
+        : 0;
+    const int block_n = is_mixed
+        ? backend_ctx->kernels_flash_attn_f32_f16_bn.at(dk_dv)
+        : backend_ctx->kernels_flash_attn_bn.at(dk_dv);
 
     ggml_tensor_extra_cl * extra_q = (ggml_tensor_extra_cl *)q->extra;
     ggml_tensor_extra_cl * extra_k = (ggml_tensor_extra_cl *)k->extra;
@@ -10095,14 +10102,134 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     max_bias      = params[1];
     logit_softcap = params[2];
 
+    if (n_q == 1) {
+        if (is_mixed) {
+            kernel = backend_ctx->kernels_flash_attn_f32_f16_q1.at(dk_dv);
+        } else if (is_f16) {
+            kernel = backend_ctx->kernels_flash_attn_f16_q1.at(dk_dv);
+        } else {
+            kernel = backend_ctx->kernels_flash_attn_f32_q1.at(dk_dv);
+        }
+    } else {
+        if (is_mixed) {
+            kernel = backend_ctx->kernels_flash_attn_f32_f16.at(dk_dv);
+        } else if (is_f16) {
+            kernel = backend_ctx->kernels_flash_attn_f16.at(dk_dv);
+        } else {
+            kernel = backend_ctx->kernels_flash_attn_f32.at(dk_dv);
+        }
+    }
+    GGML_ASSERT(kernel != NULL);
+
     ggml_cl_flash_attn_temp_buffer temp_k;
     ggml_cl_flash_attn_temp_buffer temp_v;
+    ggml_cl_flash_attn_temp_buffer temp_k_pad;
+    ggml_cl_flash_attn_temp_buffer temp_v_pad;
+    ggml_cl_flash_attn_temp_buffer temp_mask_pad;
+    ggml_cl_flash_attn_temp_buffer temp_blk;
     const ggml_type kv_target_type = is_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32;
 
     cl_mem k_data_device = extra_k->data_device;
     cl_mem v_data_device = extra_v->data_device;
     ggml_cl_flash_attn_prepare_quantized_tensor(backend_ctx, k, kv_target_type, temp_k, k_data_device, offset_k, k_nb1, k_nb2, k_nb3);
     ggml_cl_flash_attn_prepare_quantized_tensor(backend_ctx, v, kv_target_type, temp_v, v_data_device, offset_v, v_nb1, v_nb2, v_nb3);
+
+    cl_mem k_pad_buffer = NULL;
+    cl_mem v_pad_buffer = NULL;
+    cl_mem mask_pad_buffer = NULL;
+    cl_mem blk_buffer = NULL;
+    cl_ulong mask_pad_nb1 = 0;
+    cl_ulong mask_pad_nb2 = 0;
+    cl_ulong mask_pad_nb3 = 0;
+
+    const int n_q_blocks = n_q > 1 ? (n_q + block_m - 1) / block_m : 0;
+    const int n_kv_blocks = n_kv > 0 ? (n_kv + block_n - 1) / block_n : 0;
+    const bool use_mixed_prepass = is_mixed && n_q > 1;
+    const bool use_kv_pad = use_mixed_prepass && (n_kv % block_n != 0);
+    const bool use_blk_mask = use_mixed_prepass && mask_buffer != NULL;
+
+    if (use_kv_pad) {
+        cl_int err;
+
+        const size_t k_pad_size = (size_t) k_nb1 * (size_t) block_n * (size_t) n_head_kv * (size_t) n_batch;
+        temp_k_pad.data = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, k_pad_size, NULL, &err);
+        CL_CHECK(err);
+        k_pad_buffer = temp_k_pad.data;
+
+        const size_t v_pad_size = (size_t) v_nb1 * (size_t) block_n * (size_t) n_head_kv * (size_t) n_batch;
+        temp_v_pad.data = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, v_pad_size, NULL, &err);
+        CL_CHECK(err);
+        v_pad_buffer = temp_v_pad.data;
+
+        cl_kernel kernel_kv_pad = backend_ctx->kernels_flash_attn_kv_pad_f16.at(dk_dv);
+        CL_CHECK(clSetKernelArg(kernel_kv_pad, 0, sizeof(cl_mem),   &k_data_device));
+        CL_CHECK(clSetKernelArg(kernel_kv_pad, 1, sizeof(cl_ulong), &offset_k));
+        CL_CHECK(clSetKernelArg(kernel_kv_pad, 2, sizeof(cl_mem),   &v_data_device));
+        CL_CHECK(clSetKernelArg(kernel_kv_pad, 3, sizeof(cl_ulong), &offset_v));
+        CL_CHECK(clSetKernelArg(kernel_kv_pad, 4, sizeof(cl_mem),   &k_pad_buffer));
+        CL_CHECK(clSetKernelArg(kernel_kv_pad, 5, sizeof(cl_mem),   &v_pad_buffer));
+        CL_CHECK(clSetKernelArg(kernel_kv_pad, 6, sizeof(int),      &n_kv));
+        CL_CHECK(clSetKernelArg(kernel_kv_pad, 7, sizeof(int),      &n_head_kv));
+        CL_CHECK(clSetKernelArg(kernel_kv_pad, 8, sizeof(int),      &n_batch));
+        CL_CHECK(clSetKernelArg(kernel_kv_pad, 9, sizeof(cl_ulong), &k_nb1));
+        CL_CHECK(clSetKernelArg(kernel_kv_pad, 10, sizeof(cl_ulong), &k_nb2));
+        CL_CHECK(clSetKernelArg(kernel_kv_pad, 11, sizeof(cl_ulong), &k_nb3));
+        CL_CHECK(clSetKernelArg(kernel_kv_pad, 12, sizeof(cl_ulong), &v_nb1));
+        CL_CHECK(clSetKernelArg(kernel_kv_pad, 13, sizeof(cl_ulong), &v_nb2));
+        CL_CHECK(clSetKernelArg(kernel_kv_pad, 14, sizeof(cl_ulong), &v_nb3));
+
+        size_t global_work_size[] = { (size_t) block_n, (size_t) n_head_kv, (size_t) n_batch };
+        backend_ctx->enqueue_ndrange_kernel(kernel_kv_pad, 3, global_work_size, NULL, dst);
+
+        if (mask_buffer != NULL) {
+            mask_pad_nb1 = (cl_ulong) block_n * (cl_ulong) sizeof(ggml_fp16_t);
+            mask_pad_nb2 = (cl_ulong) n_q * mask_pad_nb1;
+            mask_pad_nb3 = (cl_ulong) mask_ne2 * mask_pad_nb2;
+
+            const size_t mask_pad_size = (size_t) mask_ne3 * (size_t) mask_pad_nb3;
+            temp_mask_pad.data = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, mask_pad_size, NULL, &err);
+            CL_CHECK(err);
+            mask_pad_buffer = temp_mask_pad.data;
+
+            cl_kernel kernel_mask_pad = backend_ctx->kernels_flash_attn_mask_pad_f16.at(dk_dv);
+            CL_CHECK(clSetKernelArg(kernel_mask_pad, 0, sizeof(cl_mem),   &mask_buffer));
+            CL_CHECK(clSetKernelArg(kernel_mask_pad, 1, sizeof(cl_ulong), &offset_mask));
+            CL_CHECK(clSetKernelArg(kernel_mask_pad, 2, sizeof(cl_mem),   &mask_pad_buffer));
+            CL_CHECK(clSetKernelArg(kernel_mask_pad, 3, sizeof(int),      &n_q));
+            CL_CHECK(clSetKernelArg(kernel_mask_pad, 4, sizeof(int),      &n_kv));
+            CL_CHECK(clSetKernelArg(kernel_mask_pad, 5, sizeof(cl_ulong), &mask_nb1));
+            CL_CHECK(clSetKernelArg(kernel_mask_pad, 6, sizeof(cl_ulong), &mask_nb2));
+            CL_CHECK(clSetKernelArg(kernel_mask_pad, 7, sizeof(cl_ulong), &mask_nb3));
+            CL_CHECK(clSetKernelArg(kernel_mask_pad, 8, sizeof(int),      &mask_ne2));
+            CL_CHECK(clSetKernelArg(kernel_mask_pad, 9, sizeof(int),      &mask_ne3));
+
+            size_t global_work_size_mask[] = { (size_t) block_n, (size_t) n_q, (size_t) (mask_ne2 * mask_ne3) };
+            backend_ctx->enqueue_ndrange_kernel(kernel_mask_pad, 3, global_work_size_mask, NULL, dst);
+        }
+    }
+
+    if (use_blk_mask) {
+        cl_int err;
+        const size_t blk_size = (size_t) n_kv_blocks * (size_t) n_q_blocks * (size_t) mask_ne2 * (size_t) mask_ne3;
+        temp_blk.data = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, blk_size, NULL, &err);
+        CL_CHECK(err);
+        blk_buffer = temp_blk.data;
+
+        cl_kernel kernel_blk = backend_ctx->kernels_flash_attn_blk_f16.at(dk_dv);
+        CL_CHECK(clSetKernelArg(kernel_blk, 0, sizeof(cl_mem),   &mask_buffer));
+        CL_CHECK(clSetKernelArg(kernel_blk, 1, sizeof(cl_ulong), &offset_mask));
+        CL_CHECK(clSetKernelArg(kernel_blk, 2, sizeof(cl_mem),   &blk_buffer));
+        CL_CHECK(clSetKernelArg(kernel_blk, 3, sizeof(int),      &n_q));
+        CL_CHECK(clSetKernelArg(kernel_blk, 4, sizeof(int),      &n_kv));
+        CL_CHECK(clSetKernelArg(kernel_blk, 5, sizeof(cl_ulong), &mask_nb1));
+        CL_CHECK(clSetKernelArg(kernel_blk, 6, sizeof(cl_ulong), &mask_nb2));
+        CL_CHECK(clSetKernelArg(kernel_blk, 7, sizeof(cl_ulong), &mask_nb3));
+        CL_CHECK(clSetKernelArg(kernel_blk, 8, sizeof(int),      &mask_ne2));
+        CL_CHECK(clSetKernelArg(kernel_blk, 9, sizeof(int),      &mask_ne3));
+
+        size_t global_work_size_blk[] = { (size_t) n_kv_blocks, (size_t) n_q_blocks, (size_t) (mask_ne2 * mask_ne3) };
+        backend_ctx->enqueue_ndrange_kernel(kernel_blk, 3, global_work_size_blk, NULL, dst);
+    }
 
     const int is_causal = (mask == NULL && n_q > 1 && n_q == n_kv);
 
@@ -10143,6 +10270,16 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     CL_CHECK(clSetKernelArg(kernel, 37, sizeof(int),      &mask_ne3));
     CL_CHECK(clSetKernelArg(kernel, 38, sizeof(cl_mem),   &sinks_buffer));
     CL_CHECK(clSetKernelArg(kernel, 39, sizeof(cl_ulong), &offset_sinks));
+    if (n_q > 1 && is_mixed) {
+        CL_CHECK(clSetKernelArg(kernel, 40, sizeof(cl_mem),   &k_pad_buffer));
+        CL_CHECK(clSetKernelArg(kernel, 41, sizeof(cl_mem),   &v_pad_buffer));
+        CL_CHECK(clSetKernelArg(kernel, 42, sizeof(cl_mem),   &mask_pad_buffer));
+        CL_CHECK(clSetKernelArg(kernel, 43, sizeof(cl_mem),   &blk_buffer));
+        CL_CHECK(clSetKernelArg(kernel, 44, sizeof(int),      &n_kv_blocks));
+        CL_CHECK(clSetKernelArg(kernel, 45, sizeof(cl_ulong), &mask_pad_nb1));
+        CL_CHECK(clSetKernelArg(kernel, 46, sizeof(cl_ulong), &mask_pad_nb2));
+        CL_CHECK(clSetKernelArg(kernel, 47, sizeof(cl_ulong), &mask_pad_nb3));
+    }
 
     if (n_q == 1) {
         const size_t wg_size = 64;
@@ -10150,7 +10287,6 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         size_t global_work_size[] = { wg_size, (size_t)(n_head * n_batch) };
         backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, dst);
     } else {
-        const int block_m = backend_ctx->kernels_flash_attn_bm.at(dk_dv);
         const size_t wg_size = block_m;
         size_t local_work_size[] = { wg_size, 1 };
         size_t global_work_size[] = { (size_t)((n_q + block_m - 1) / block_m) * wg_size, (size_t)(n_head * n_batch) };
@@ -12171,7 +12307,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 GGML_ASSERT(ne11 == ne1);
                 GGML_ASSERT(ne01 == ne0);
 
-                if (backend_ctx->gpu_family == INTEL) {
+                if (ggml_cl_gpu_family_is_intel_like(backend_ctx->gpu_family)) {
                     nth0 = 16;
                     nth1 = 1;
 
@@ -12210,7 +12346,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             size_t global_work_size[] = {(size_t)(ne01 + 7)/8*nth0, (size_t)ne11*nth1, (size_t)ne12*ne13};
             size_t local_work_size[] = {(size_t)nth0, (size_t)nth1, 1};
 
-            if (backend_ctx->gpu_family == INTEL) {
+            if (ggml_cl_gpu_family_is_intel_like(backend_ctx->gpu_family)) {
                 // Set global size for Intel. It uses 16x output values.
                 global_work_size[0] = (size_t)(ne01 + 15)/16*nth0;
                 global_work_size[1] = (size_t)ne11*nth1;
@@ -12233,7 +12369,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             kernel = backend_ctx->kernel_mul_mat_f32_f32;
             nrows = 4;
 
-            if (backend_ctx->gpu_family == INTEL) {
+            if (ggml_cl_gpu_family_is_intel_like(backend_ctx->gpu_family)) {
                 nth0 = 32;
                 nth1 = 1;
             } else if (backend_ctx->gpu_family == ADRENO) {
@@ -12270,7 +12406,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             break;
         case GGML_TYPE_F16:
             //GGML_ASSERT(ne02 == ne12);
-            if (backend_ctx->gpu_family == INTEL) {
+            if (ggml_cl_gpu_family_is_intel_like(backend_ctx->gpu_family)) {
                 nth0 = 32;
                 nth1 = 1;
             } else if (backend_ctx->gpu_family == ADRENO) {
@@ -12335,7 +12471,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             if (ggml_opencl_uses_local_subgroup_compat(backend_ctx)) {
                 nth0 = 32; // one warp; __local float8 tree-reduction inside kernel
                 nth1 = 1;
-            } else if (backend_ctx->gpu_family == INTEL) {
+            } else if (ggml_cl_gpu_family_is_intel_like(backend_ctx->gpu_family)) {
                 nth0 = 16;
                 nth1 = 1;
             } else if (backend_ctx->gpu_family == ADRENO) {
@@ -12361,7 +12497,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             CL_CHECK(clSetKernelArg(kernel, 13, sizeof(int),      &r2));
             CL_CHECK(clSetKernelArg(kernel, 14, sizeof(int),      &r3));
 #else // GGML_OPENCL_SOA_Q
-            if (backend_ctx->gpu_family == INTEL) {
+            if (ggml_cl_gpu_family_is_intel_like(backend_ctx->gpu_family)) {
                 // Use 1D local size. Each workgroup is a SIMD group. Each SIMD
                 // group produces N_DST (4 for Q4_0 kernel) values in the result.
                 // The number of workgroups on dim 0 (the leading dimension) is
@@ -12405,7 +12541,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             if (ggml_opencl_uses_local_subgroup_compat(backend_ctx)) {
                 nth0 = 32; // one warp; __local float4 tree-reduction inside kernel
                 nth1 = 1;
-            } else if (backend_ctx->gpu_family == INTEL) {
+            } else if (ggml_cl_gpu_family_is_intel_like(backend_ctx->gpu_family)) {
                 nth0 = 16;
                 nth1 = 1;
             } else if (backend_ctx->gpu_family == ADRENO) {
@@ -12432,7 +12568,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             CL_CHECK(clSetKernelArg(kernel, 14, sizeof(int),      &r2));
             CL_CHECK(clSetKernelArg(kernel, 15, sizeof(int),      &r3));
 #else
-            if (backend_ctx->gpu_family == INTEL) {
+            if (ggml_cl_gpu_family_is_intel_like(backend_ctx->gpu_family)) {
                 nth0 = 16;
                 nth1 = 1;
                 ndst = 4;
@@ -12509,7 +12645,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 nth0 = 32; // N_SIMDWIDTH (warp size)
                 nth1 = 1;  // N_SG_Q8_0
                 ndst = 4;  // N_R0_Q8_0
-            } else if (backend_ctx->gpu_family == INTEL) {
+            } else if (ggml_cl_gpu_family_is_intel_like(backend_ctx->gpu_family)) {
                 nth0 = 16;
                 nth1 = 2;
                 ndst = nth1*4;
@@ -12546,7 +12682,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             // nth0 - subgroup size
             // nth1 - number of subgroups per workgroup
             // ndst - number of output values per workgroup = output per subgroup * number of subgroups
-            if (backend_ctx->gpu_family == INTEL) {
+            if (ggml_cl_gpu_family_is_intel_like(backend_ctx->gpu_family)) {
                 nth0 = 16;
                 nth1 = 2;
                 ndst = nth1*4;
@@ -12669,7 +12805,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 nth0 = 32;
                 nth1 = 1;
                 ndst = 4;
-            } else if (backend_ctx->gpu_family == INTEL) {
+            } else if (ggml_cl_gpu_family_is_intel_like(backend_ctx->gpu_family)) {
                 // nth0=16 for both true Intel and Apple M1 compat mode.
                 nth0 = 16;
                 nth1 = 1;
@@ -12730,7 +12866,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 CL_CHECK(clSetKernelArg(kernel, 14, sizeof(int),      &ne1));
                 CL_CHECK(clSetKernelArg(kernel, 15, sizeof(int),      &r2));
                 CL_CHECK(clSetKernelArg(kernel, 16, sizeof(int),      &r3));
-            } else if (backend_ctx->gpu_family == INTEL) {
+            } else if (ggml_cl_gpu_family_is_intel_like(backend_ctx->gpu_family)) {
                 kernel = backend_ctx->kernel_mul_mv_q6_K_f32_flat;
                 nth0 = 16;
                 nth1 = 2;
@@ -12782,7 +12918,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 #else
             kernel = backend_ctx->kernel_mul_mv_q6_K_f32;
 
-            if (backend_ctx->gpu_family == INTEL) {
+            if (ggml_cl_gpu_family_is_intel_like(backend_ctx->gpu_family)) {
                 nth0 = 16;
                 nth1 = 2;
                 ndst = 1;
@@ -12822,7 +12958,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 ndst = 2;
 
                 q = extra0_mxfp4->q;
-            } else if (backend_ctx->gpu_family == INTEL) {
+            } else if (ggml_cl_gpu_family_is_intel_like(backend_ctx->gpu_family)) {
                 nth0 = 16;
                 nth1 = 2;
                 ndst = nth1*2;
@@ -12859,7 +12995,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 #else
             kernel = backend_ctx->kernel_mul_mv_mxfp4_f32;
 
-            if (backend_ctx->gpu_family == INTEL) {
+            if (ggml_cl_gpu_family_is_intel_like(backend_ctx->gpu_family)) {
                 nth0 = 16;
                 nth1 = 2;
                 ndst = nth1*2;
@@ -13015,7 +13151,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
         case GGML_TYPE_Q4_0: {
             kernel = backend_ctx->kernel_mul_mv_id_q4_0_f32_8x_flat;
 
-            if (backend_ctx->gpu_family == INTEL) {
+            if (ggml_cl_gpu_family_is_intel_like(backend_ctx->gpu_family)) {
                 sgs  = 16;
                 nsg  = 1;
                 ndst = 8;
@@ -13059,7 +13195,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 #ifdef GGML_OPENCL_SOA_Q
             kernel = backend_ctx->kernel_mul_mv_id_q8_0_f32_flat;
 
-            if (backend_ctx->gpu_family == INTEL) {
+            if (ggml_cl_gpu_family_is_intel_like(backend_ctx->gpu_family)) {
                 sgs  = 16;
                 nsg  = 2;
                 ndst = 4;
@@ -13095,7 +13231,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 #else
             kernel = backend_ctx->kernel_mul_mv_id_q8_0_f32;
 
-            if (backend_ctx->gpu_family == INTEL) {
+            if (ggml_cl_gpu_family_is_intel_like(backend_ctx->gpu_family)) {
                 sgs  = 16;
                 nsg  = 2;
                 ndst = 4;
@@ -13241,7 +13377,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                 ndst = 2;
 
                 q = extra0_mxfp4->q;
-            } else if (backend_ctx->gpu_family == INTEL) {
+            } else if (ggml_cl_gpu_family_is_intel_like(backend_ctx->gpu_family)) {
                 sgs  = 16;
                 nsg  = 2;
                 ndst = 2;
@@ -13284,7 +13420,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 #else // GGML_OPENCL_SOA_Q
             kernel = backend_ctx->kernel_mul_mv_id_mxfp4_f32;
 
-            if (backend_ctx->gpu_family == INTEL) {
+            if (ggml_cl_gpu_family_is_intel_like(backend_ctx->gpu_family)) {
                 sgs  = 16;
                 nsg  = 2;
                 ndst = 2;
@@ -13763,7 +13899,7 @@ static void ggml_cl_soft_max(ggml_backend_t backend, const ggml_tensor * src0, c
     // where a row corresponds to leading dimension.
     int nth = MIN(32, ne00);
 
-    if (backend_ctx->gpu_family == INTEL) {
+    if (ggml_cl_gpu_family_is_intel_like(backend_ctx->gpu_family)) {
         // This is the same as the initial value.
         nth = MIN(32, ne00);
     }
