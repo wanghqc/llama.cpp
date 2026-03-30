@@ -161,17 +161,29 @@ __kernel void flash_attn_f32_f16(
     __local KV_DATA_TYPE4 l_v[BLOCK_N][DV_VEC];
 
 #if N_SPLIT > 1
-    // Local memory for the dot-product reduction across N_SPLIT threads and
-    // for broadcasting the per-query softmax update to all split_idx threads.
-    __local ACC_TYPE local_partial0[BLOCK_M][N_SPLIT];
-    __local ACC_TYPE local_partial1[BLOCK_M][N_SPLIT];
+    // local_partial[BLOCK_N][WG_SIZE]: each thread writes at [j][tid].
+    // Bank for j=0: tid % 32 → exactly 4-way conflict (theoretical minimum for
+    // 128 threads / 32 banks).  The previous layout [BLOCK_M][BLOCK_N][N_SPLIT]
+    // had stride BLOCK_N*N_SPLIT=128; since 128%32==0 all q_lanes mapped to the
+    // same 8 banks → 16-way conflicts.  The new layout cuts write serialisation
+    // by 4x at the cost of zero extra memory (BLOCK_N*WG_SIZE == BLOCK_M*BLOCK_N*N_SPLIT).
+    __local ACC_TYPE local_partial[BLOCK_N][WG_SIZE];
+    __local ACC_TYPE local_p[BLOCK_M][BLOCK_N];
     __local ACC_TYPE local_softmax_scale[BLOCK_M];
-    __local ACC_TYPE local_softmax_p0[BLOCK_M];
-    __local ACC_TYPE local_softmax_p1[BLOCK_M];
     __local ACC_TYPE local_l_inv[BLOCK_M];
 #endif
 
     for (int k_start = 0; k_start < n_kv; k_start += BLOCK_N) {
+        // Skip fully-masked KV blocks before loading K/V tiles.
+        // blk_base[k_start/BLOCK_N] is uniform across all threads in the work group
+        // (same pointer, same k_start), so the continue is a uniform branch — safe.
+        // For causal PP this skips ~50% of KV global memory reads.
+        char blk_cur = 1;
+        if (blk_base != NULL) {
+            blk_cur = blk_base[k_start / BLOCK_N];
+            if (blk_cur == 0) continue;
+        }
+
         const int use_kv_pad = k_pad_void != NULL && k_start + BLOCK_N > n_kv;
         const int k_tile_start = use_kv_pad ? 0 : k_start;
         const ulong k_tile_nb2 = use_kv_pad ? (ulong) BLOCK_N * k_nb1 : k_nb2;
@@ -205,105 +217,100 @@ __kernel void flash_attn_f32_f16(
         }
         barrier(CLK_LOCAL_MEM_FENCE);
 
-        char blk_cur = 1;
-        if (blk_base != NULL) {
-            blk_cur = blk_base[k_start / BLOCK_N];
-        }
-        if (blk_cur == 0) {
-            continue;
-        }
-
 #if N_SPLIT > 1
         // ----------------------------------------------------------------
-        // N_SPLIT > 1 path: split dot product across threads per query.
-        // All threads execute the loop body to keep barriers uniform.
+        // N_SPLIT > 1 path: batched dot-product reduction.
+        // Phase 1: every thread computes its partial dot for all BLOCK_N
+        //          tokens and writes to local_partial[j][tid].
+        // Phase 2: split_idx==0 reduces, computes full block softmax update,
+        //          writes probabilities to local_p[q_lane][j].
+        // Phase 3: all threads accumulate their DV slice using local_p.
+        //
+        // 2 barriers per KV block vs the original BLOCK_N barriers.
         // ----------------------------------------------------------------
-        for (int j = 0; j < BLOCK_N; j += 2) {
-            const int k_row0 = k_start + j;
-            const int k_row1 = k_start + j + 1;
 
-            // Each thread computes a partial dot product over its DK slice.
-            ACC_TYPE4 dot_acc0 = (ACC_TYPE4)(0.0f);
-            ACC_TYPE4 dot_acc1 = (ACC_TYPE4)(0.0f);
+        // Phase 1 — partial dots for all BLOCK_N tokens.
+        // Write to local_partial[j][tid]: consecutive tids map to consecutive
+        // banks (bank = tid%32), giving 4-way conflicts (theoretical minimum
+        // for WG_SIZE=128 threads, 32 banks).
+        for (int j = 0; j < BLOCK_N; ++j) {
+            ACC_TYPE4 dot_acc = (ACC_TYPE4)(0.0f);
             #pragma unroll
             for (int k = 0; k < SPLIT_DK_VEC; k++) {
-                dot_acc0 = mad(q_priv[k], CONVERT_KV_ACC4(l_k[j  ][dk_off + k]), dot_acc0);
-                dot_acc1 = mad(q_priv[k], CONVERT_KV_ACC4(l_k[j+1][dk_off + k]), dot_acc1);
+                dot_acc = mad(q_priv[k], CONVERT_KV_ACC4(l_k[j][dk_off + k]), dot_acc);
             }
-            local_partial0[q_lane][split_idx] = dot_acc0.s0 + dot_acc0.s1 + dot_acc0.s2 + dot_acc0.s3;
-            local_partial1[q_lane][split_idx] = dot_acc1.s0 + dot_acc1.s1 + dot_acc1.s2 + dot_acc1.s3;
-            barrier(CLK_LOCAL_MEM_FENCE);
+            local_partial[j][tid] =
+                dot_acc.s0 + dot_acc.s1 + dot_acc.s2 + dot_acc.s3;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);  // 1 barrier: partial dots visible
 
-            // split_idx==0 reduces the partial sums and computes the softmax
-            // update for this query.  For invalid query rows it writes neutral
-            // values (scale=1, p=0) so all threads' o_acc update is a no-op.
-            if (split_idx == 0) {
-                ACC_TYPE score0 = 0.0f;
-                ACC_TYPE score1 = 0.0f;
-                #pragma unroll
-                for (int s = 0; s < N_SPLIT; s++) {
-                    score0 += local_partial0[q_lane][s];
-                    score1 += local_partial1[q_lane][s];
-                }
-                score0 *= scale;
-                score1 *= scale;
-
-                if (query_valid) {
-                    if (is_causal) {
-                        if (k_row0 > (n_kv - n_q + my_query_row)) score0 = -INFINITY;
-                        if (k_row1 > (n_kv - n_q + my_query_row)) score1 = -INFINITY;
+        // Phase 2 — split_idx==0 reduces partial sums and computes block softmax.
+        if (split_idx == 0) {
+            if (query_valid) {
+                ACC_TYPE m_new = m_i;
+                for (int j = 0; j < BLOCK_N; ++j) {
+                    const int k_row = k_start + j;
+                    ACC_TYPE score = 0.0f;
+                    #pragma unroll
+                    for (int s = 0; s < N_SPLIT; s++) {
+                        score += local_partial[j][q_lane * N_SPLIT + s];
                     }
+                    score *= scale;
 
-                    if (k_row0 >= n_kv) score0 = -INFINITY;
-                    if (k_row1 >= n_kv) score1 = -INFINITY;
+                    if (is_causal && k_row > (n_kv - n_q + my_query_row)) score = -INFINITY;
+                    if (k_row >= n_kv) score = -INFINITY;
 
                     if (mask_base != NULL && blk_cur != 2) {
                         if (use_kv_pad && mask_pad_base != NULL) {
-                            const global MASK_DATA_TYPE* mask_ptr = (const global MASK_DATA_TYPE*)(mask_pad_base + my_query_row * mask_pad_nb1);
-                            score0 += slope * (ACC_TYPE)mask_ptr[j];
-                            score1 += slope * (ACC_TYPE)mask_ptr[j + 1];
+                            const global MASK_DATA_TYPE* mask_ptr =
+                                (const global MASK_DATA_TYPE*)(mask_pad_base + my_query_row * mask_pad_nb1);
+                            score += slope * (ACC_TYPE)mask_ptr[j];
                         } else {
-                            const global MASK_DATA_TYPE* mask_ptr = (const global MASK_DATA_TYPE*)(mask_base + my_query_row * mask_nb1);
-                            if (k_row0 < n_kv) score0 += slope * (ACC_TYPE)mask_ptr[k_row0];
-                            if (k_row1 < n_kv) score1 += slope * (ACC_TYPE)mask_ptr[k_row1];
+                            const global MASK_DATA_TYPE* mask_ptr =
+                                (const global MASK_DATA_TYPE*)(mask_base + my_query_row * mask_nb1);
+                            if (k_row < n_kv) score += slope * (ACC_TYPE)mask_ptr[k_row];
                         }
                     }
 
                     if (logit_softcap > 0.0f) {
-                        score0 = logit_softcap * tanh(score0 / logit_softcap);
-                        score1 = logit_softcap * tanh(score1 / logit_softcap);
+                        score = logit_softcap * tanh(score / logit_softcap);
                     }
 
-                    const ACC_TYPE m_new = max(m_i, max(score0, score1));
-                    const ACC_TYPE p0 = exp(score0 - m_new);
-                    const ACC_TYPE p1 = exp(score1 - m_new);
-                    const ACC_TYPE sp = exp(m_i - m_new);
-
-                    local_softmax_scale[q_lane] = sp;
-                    local_softmax_p0[q_lane] = p0;
-                    local_softmax_p1[q_lane] = p1;
-
-                    l_i = l_i * sp + p0 + p1;
-                    m_i = m_new;
-                } else {
-                    // invalid query row — neutral values
-                    local_softmax_scale[q_lane] = 1.0f;
-                    local_softmax_p0[q_lane] = 0.0f;
-                    local_softmax_p1[q_lane] = 0.0f;
+                    m_new = max(m_new, score);
+                    local_p[q_lane][j] = score;
                 }
-            }
-            barrier(CLK_LOCAL_MEM_FENCE);
 
-            // All threads update their DV slice using the broadcast values.
-            const ACC_TYPE sp_val = local_softmax_scale[q_lane];
-            const ACC_TYPE p0_val = local_softmax_p0[q_lane];
-            const ACC_TYPE p1_val = local_softmax_p1[q_lane];
+                const ACC_TYPE sp = exp(m_i - m_new);
+                ACC_TYPE l_new = l_i * sp;
+                for (int j = 0; j < BLOCK_N; ++j) {
+                    const ACC_TYPE p = exp(local_p[q_lane][j] - m_new);
+                    local_p[q_lane][j] = p;
+                    l_new += p;
+                }
+                local_softmax_scale[q_lane] = sp;
+                l_i = l_new;
+                m_i = m_new;
+            } else {
+                local_softmax_scale[q_lane] = 1.0f;
+                for (int j = 0; j < BLOCK_N; ++j) local_p[q_lane][j] = 0.0f;
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);  // probabilities visible to all threads
+
+        // Phase 3 — accumulate V using broadcast probabilities from local_p.
+        {
+            const ACC_TYPE sp_block = local_softmax_scale[q_lane];
             const int dv_off = split_idx * SPLIT_DV_VEC;
             #pragma unroll
             for (int i = 0; i < SPLIT_DV_VEC; ++i) {
-                o_acc[i] = o_acc[i] * sp_val
-                         + p0_val * CONVERT_KV_ACC4(l_v[j  ][dv_off + i])
-                         + p1_val * CONVERT_KV_ACC4(l_v[j+1][dv_off + i]);
+                o_acc[i] *= sp_block;
+            }
+            for (int j = 0; j < BLOCK_N; ++j) {
+                const ACC_TYPE p = local_p[q_lane][j];
+                #pragma unroll
+                for (int i = 0; i < SPLIT_DV_VEC; ++i) {
+                    o_acc[i] = mad(p, CONVERT_KV_ACC4(l_v[j][dv_off + i]), o_acc[i]);
+                }
             }
         }
 #else
@@ -370,8 +377,7 @@ __kernel void flash_attn_f32_f16(
     // Write output
     // ----------------------------------------------------------------
 #if N_SPLIT > 1
-    // split_idx==0 computes and stores l_inv (and handles sinks), then all
-    // threads collectively write their DV slice.
+    // split_idx==0 finalises l_inv (handles sinks), broadcasts to all threads.
     if (split_idx == 0) {
         ACC_TYPE sinks_sp = 1.0f;
         if (query_valid && sinks_void != NULL) {

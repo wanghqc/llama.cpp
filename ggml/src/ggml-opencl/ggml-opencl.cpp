@@ -2167,11 +2167,13 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
                 { 40,  40, 32, 32, 1, 0}, { 64,  64, 32, 32, 1, 0}, { 80,  80, 32, 32, 1, 0}, { 96,  96, 32, 32, 1, 0},
                 {112, 112, 32, 32, 1, 0}, {128, 128, 32, 32, 1, 0}, {192, 128, 16, 16, 1, 0},
                 {192, 192, 16, 16, 1, 0},
-                // DK=256: N_SPLIT=8 reduces register pressure from 512 to 64 floats/thread.
-                // WG_SIZE = BLOCK_M * N_SPLIT = 16 * 8 = 128.
-                // Barrier overhead dominates at short n_kv; use split kernel only when
-                // n_kv >= 2048 (empirically determined on Apple M1).
-                {256, 256, 16, 16, 8, 2048},
+                // DK=256: BLOCK_M=32/N_SPLIT=4 — 2× more queries share each K/V tile
+                // vs the previous BLOCK_M=16/N_SPLIT=8, halving effective K/V bandwidth.
+                // WG_SIZE = BLOCK_M * N_SPLIT = 32 * 4 = 128 (unchanged).
+                // Each thread holds DK/N_SPLIT/4=16 float4 for q+o = 128 floats (fits 256-reg file).
+                // N_SPLIT=4 always preferred (threshold=0): baseline N_SPLIT=1 with BLOCK_M=32
+                // would need q_priv[64]+o_acc[64] = 512 floats → exceeds 256-reg file → spills.
+                {256, 256, 32, 16, 4, 0},
             };
             const size_t fa_dims_count = sizeof(fa_dims_default)/sizeof(fa_dims_default[0]);
 
