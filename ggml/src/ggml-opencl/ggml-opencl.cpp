@@ -10250,6 +10250,12 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         cl_int err;
         const size_t blk_size = (size_t) n_kv_blocks * (size_t) n_q_blocks * (size_t) mask_ne2 * (size_t) mask_ne3;
         temp_blk.data = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, blk_size, NULL, &err);
+        if (err != CL_SUCCESS) {
+            // Flush all pending GPU work so the driver can reclaim deferred deallocations,
+            // then retry. This handles intermittent OOM after long benchmark runs.
+            CL_CHECK(clFinish(backend_ctx->queue));
+            temp_blk.data = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, blk_size, NULL, &err);
+        }
         CL_CHECK(err);
         blk_buffer = temp_blk.data;
 
