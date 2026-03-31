@@ -2164,8 +2164,21 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
             struct fa_dim { int dk; int dv; int bm; int bn; int n_split; int nkv_split_threshold; };
 
             const fa_dim fa_dims_default[] = {
-                { 40,  40, 32, 32, 1, 0}, { 64,  64, 32, 32, 1, 0}, { 80,  80, 32, 32, 1, 0}, { 96,  96, 32, 32, 1, 0},
-                {112, 112, 32, 32, 1, 0}, {128, 128, 32, 32, 1, 0}, {192, 128, 16, 16, 1, 0},
+                // BLOCK_M=64 fills one Adreno wavefront (64 threads) for DK <= 128,
+                // vs the previous BLOCK_M=32 which ran at 50% wavefront utilisation.
+                // Register budget per thread is unchanged: q_priv[DK/4] + o_acc[DV/4]
+                // floats — thread count does not affect per-thread register pressure.
+                // Local memory: only l_k[BN][DK/4] + l_v[BN][DV/4] ≈ 8 KB for DK=64.
+                //
+                // DK=64: N_SPLIT=1 (no split variant). Testing showed that N_SPLIT=2 with
+                // WG_SIZE=128 (2 Adreno wavefronts) + redundant softmax on both split
+                // threads is a net loss vs the clean 1-wavefront N_SPLIT=1 path.
+                { 40,  40, 64, 32, 1, 0}, { 64,  64, 64, 32, 1, 0},
+                { 80,  80, 64, 32, 1, 0}, { 96,  96, 64, 32, 1, 0},
+                {112, 112, 64, 32, 1, 0}, {128, 128, 64, 32, 1, 0},
+                // DK=192: larger register footprint (q+o = 80-96 float4) — keep
+                // BLOCK_M=16 to avoid spilling; tune separately if needed.
+                {192, 128, 16, 16, 1, 0},
                 {192, 192, 16, 16, 1, 0},
                 // DK=256: BLOCK_M=32/N_SPLIT=4 — 2× more queries share each K/V tile
                 // vs the previous BLOCK_M=16/N_SPLIT=8, halving effective K/V bandwidth.
