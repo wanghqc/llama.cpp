@@ -316,9 +316,9 @@ __kernel void flash_attn_f32_f16(
 
                 // --- Online softmax update (identical on all N_SPLIT threads) ---
                 const ACC_TYPE m_new = max(m_i, max(score0, score1));
-                const ACC_TYPE sp    = exp(m_i - m_new);
-                const ACC_TYPE p0    = exp(score0 - m_new);
-                const ACC_TYPE p1    = exp(score1 - m_new);
+                const ACC_TYPE sp    = native_exp(m_i - m_new);
+                const ACC_TYPE p0    = native_exp(score0 - m_new);
+                const ACC_TYPE p1    = native_exp(score1 - m_new);
 
                 #pragma unroll
                 for (int i = 0; i < SPLIT_DV_VEC; ++i) {
@@ -390,10 +390,10 @@ __kernel void flash_attn_f32_f16(
                     local_p[q_lane][j] = score;
                 }
 
-                const ACC_TYPE sp = exp(m_i - m_new);
+                const ACC_TYPE sp = native_exp(m_i - m_new);
                 ACC_TYPE l_new = l_i * sp;
                 for (int j = 0; j < BLOCK_N; ++j) {
-                    const ACC_TYPE p = exp(local_p[q_lane][j] - m_new);
+                    const ACC_TYPE p = native_exp(local_p[q_lane][j] - m_new);
                     local_p[q_lane][j] = p;
                     l_new += p;
                 }
@@ -497,11 +497,11 @@ __kernel void flash_attn_f32_f16(
                 }
 
                 const ACC_TYPE m_new      = max(m_i, max(max(s0, s1), max(s2, s3)));
-                const ACC_TYPE scale_prev = exp(m_i - m_new);
-                const ACC_TYPE p0         = exp(s0 - m_new);
-                const ACC_TYPE p1         = exp(s1 - m_new);
-                const ACC_TYPE p2         = exp(s2 - m_new);
-                const ACC_TYPE p3         = exp(s3 - m_new);
+                const ACC_TYPE scale_prev = native_exp(m_i - m_new);
+                const ACC_TYPE p0         = native_exp(s0 - m_new);
+                const ACC_TYPE p1         = native_exp(s1 - m_new);
+                const ACC_TYPE p2         = native_exp(s2 - m_new);
+                const ACC_TYPE p3         = native_exp(s3 - m_new);
 
                 #pragma unroll
                 for (int i = 0; i < DV_VEC; ++i) {

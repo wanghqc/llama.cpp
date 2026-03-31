@@ -177,11 +177,11 @@ __kernel void flash_attn_f32(
             }
 
             const ACC_TYPE m_new      = max(m_i, max(max(s0, s1), max(s2, s3)));
-            const ACC_TYPE scale_prev = exp(m_i - m_new);
-            const ACC_TYPE p0         = exp(s0 - m_new);
-            const ACC_TYPE p1         = exp(s1 - m_new);
-            const ACC_TYPE p2         = exp(s2 - m_new);
-            const ACC_TYPE p3         = exp(s3 - m_new);
+            const ACC_TYPE scale_prev = native_exp(m_i - m_new);
+            const ACC_TYPE p0         = native_exp(s0 - m_new);
+            const ACC_TYPE p1         = native_exp(s1 - m_new);
+            const ACC_TYPE p2         = native_exp(s2 - m_new);
+            const ACC_TYPE p3         = native_exp(s3 - m_new);
 
             #pragma unroll
             for (int i = 0; i < DV_VEC; ++i) {

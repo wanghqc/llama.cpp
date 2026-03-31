@@ -2170,12 +2170,20 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
                 // floats — thread count does not affect per-thread register pressure.
                 // Local memory: only l_k[BN][DK/4] + l_v[BN][DV/4] ≈ 8 KB for DK=64.
                 //
-                // DK=64: N_SPLIT=1 (no split variant). Testing showed that N_SPLIT=2 with
-                // WG_SIZE=128 (2 Adreno wavefronts) + redundant softmax on both split
-                // threads is a net loss vs the clean 1-wavefront N_SPLIT=1 path.
-                { 40,  40, 64, 32, 1, 0}, { 64,  64, 64, 32, 1, 0},
-                { 80,  80, 64, 32, 1, 0}, { 96,  96, 64, 32, 1, 0},
-                {112, 112, 64, 32, 1, 0}, {128, 128, 64, 32, 1, 0},
+                // DK=64: BLOCK_N=64 (doubled from 32) — halves the serial tile count at
+                // PP4096 from 128 to 64.  Local mem: l_k[64][16]+l_v[64][16] half4 = 16KB
+                // (f32_f16 path) or 32KB (f16/f32 paths) — fits within 32KB budget.
+                // N_SPLIT=1: N_SPLIT=2 tested earlier and found to be a net loss (extra
+                // shuffle + 2× WG overhead outweighs the register reduction for DK=64).
+                { 40,  40, 64, 32, 1, 0}, { 64,  64, 64, 64, 1, 0},
+                // DK=80-128: N_SPLIT=2 with shuffle (Adreno) — halves register pressure
+                // (q_priv+o_acc: 256→128 floats for DK=128) enabling better occupancy.
+                // WG_SIZE = BLOCK_M * N_SPLIT = 64 * 2 = 128 (two wavefronts).
+                // Each thread: SPLIT_DK_VEC = DK_VEC/2 → fits comfortably in 256-reg file.
+                // Shuffle XOR reduction: 1 step (log2(2)=1), minimal overhead.
+                // Threshold=0: always prefer N_SPLIT=2 for prefill (n_q>1).
+                { 80,  80, 64, 32, 2, 0}, { 96,  96, 64, 32, 2, 0},
+                {112, 112, 64, 32, 2, 0}, {128, 128, 64, 32, 2, 0},
                 // DK=192: larger register footprint (q+o = 80-96 float4) — keep
                 // BLOCK_M=16 to avoid spilling; tune separately if needed.
                 {192, 128, 16, 16, 1, 0},
