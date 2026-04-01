@@ -1560,6 +1560,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
+#endif // GGML_OPENCL_SOA_Q
 
     // mul_mv_q6_k_f32
     {
@@ -1892,7 +1893,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
     // Adreno, Apple, or Intel.  Skipping on non-NVIDIA saves ~20-50 MB of
     // driver-managed GPU memory for the compiled kernel binary.
 #ifdef GGML_OPENCL_SOA_Q
-    if (experimental_nvidia) {
+    if (backend_ctx->device_name.find("NVIDIA") != std::string::npos) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
         const std::string kernel_src_q4k_mm {
             #include "mul_mm_q4_k_f32_l4_lm.cl.h"
@@ -2180,22 +2181,22 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
                 // floats — thread count does not affect per-thread register pressure.
                 // Local memory: only l_k[BN][DK/4] + l_v[BN][DV/4] ≈ 8 KB for DK=64.
                 //
-                // DK=64: BLOCK_N=64 (doubled from 32) — halves the serial tile count at
-                // PP4096 from 128 to 64.  Local mem: l_k[64][16]+l_v[64][16] half4 = 16KB
-                // (f32_f16 path) or 32KB (f16/f32 paths) — fits within 32KB budget.
-                // N_SPLIT=1: N_SPLIT=2 tested earlier and found to be a net loss (extra
-                // shuffle + 2× WG overhead outweighs the register reduction for DK=64).
+                // DK=64: BLOCK_N=64 — halves serial tile count at PP4096 (128→64).
+                // Local mem: l_k[64][16]+l_v[64][16] half4 = 16KB (f32_f16) — fits 32KB.
+                // N_SPLIT=1: N_SPLIT=2 re-tested with j+=4 shuffle but regressed Qwen3-0.6B
+                // −9% at pp4096 (shuffle overhead > register benefit for SPLIT_DK_VEC=8).
                 { 40,  40, 64, 32, 1, 0}, { 64,  64, 64, 64, 1, 0},
-                // DK=80-128: N_SPLIT=2 with shuffle (Adreno) — halves register pressure
-                // (q_priv+o_acc: 256→128 floats for DK=128) enabling better occupancy.
+                // DK=80-128: N_SPLIT=2 with shuffle (Adreno) — halves register pressure.
                 // WG_SIZE = BLOCK_M * N_SPLIT = 64 * 2 = 128 (two wavefronts).
-                // Each thread: SPLIT_DK_VEC = DK_VEC/2 → fits comfortably in 256-reg file.
+                // DK=96: BLOCK_N=32 — BLOCK_N=64 would require l_k[64][24]+l_v[64][24]
+                // float4 = 48KB for f16/f32 kernels, exceeding the 32KB local mem limit.
                 // Shuffle XOR reduction: 1 step (log2(2)=1), minimal overhead.
                 // Threshold=0: always prefer N_SPLIT=2 for prefill (n_q>1).
                 { 80,  80, 64, 32, 2, 0}, { 96,  96, 64, 32, 2, 0},
                 {112, 112, 64, 32, 2, 0}, {128, 128, 64, 32, 2, 0},
-                // DK=192: larger register footprint (q+o = 80-96 float4) — keep
-                // BLOCK_M=16 to avoid spilling; tune separately if needed.
+                // DK=192: BLOCK_M=16/N_SPLIT=1 — N_SPLIT=2+BLOCK_M=64 tried but regressed
+                // Gemma −13.7% at pp4096 vs −10% (WG overhead + BLOCK_N=16 KV load
+                // inefficiency with 128 threads loading only 10 elements each).
                 {192, 128, 16, 16, 1, 0},
                 {192, 192, 16, 16, 1, 0},
                 // DK=256: BLOCK_M=32/N_SPLIT=4 — 2× more queries share each K/V tile
@@ -3249,6 +3250,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
         }
         GGML_LOG_CONT(".");
     }
+    } // if (backend_ctx->use_adreno_kernels)
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
     GGML_LOG_CONT("\n");
 }
@@ -3834,6 +3836,7 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
     // first use.  Do NOT preallocate here: for large models (7B+) the pool
     // already uses ~4 GB, and reserving 350+ MB at init pushes the total
     // over the GPU memory limit causing context-creation failure.
+    } // if (backend_ctx->use_adreno_kernels)
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
 
     backend_ctx->disable_fusion = getenv("GGML_OPENCL_DISABLE_FUSION") != nullptr;
@@ -12868,43 +12871,6 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 CL_CHECK(clSetKernelArg(kernel, 16, sizeof(int),      &ne1));
                 CL_CHECK(clSetKernelArg(kernel, 17, sizeof(int),      &r2));
                 CL_CHECK(clSetKernelArg(kernel, 18, sizeof(int),      &r3));
-                break;
-            } else {
-                kernel = backend_ctx->kernel_mul_mv_q4_K_f32_flat;
-
-                if (backend_ctx->gpu_family == INTEL) {
-                    nth0 = 16;
-                    nth1 = 1;
-                    ndst = 4;
-                } else if (backend_ctx->gpu_family == ADRENO) {
-                    nth0 = 64;
-                    nth1 = 2;
-                    ndst = 16;
-                } else {
-                    GGML_ASSERT(false && "TODO: Unknown GPU");
-                }
-
-                CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0_q4_K->qs));
-                CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_mem),   &extra0_q4_K->scales));
-                CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &extra0_q4_K->d));
-                CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_mem),   &extra0_q4_K->dmin));
-                CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_mem),   &extra1->data_device));
-                CL_CHECK(clSetKernelArg(kernel,  5, sizeof(int),      &offset1));
-                CL_CHECK(clSetKernelArg(kernel,  6, sizeof(cl_mem),   &extrad->data_device));
-                CL_CHECK(clSetKernelArg(kernel,  7, sizeof(int),      &offsetd));
-                CL_CHECK(clSetKernelArg(kernel,  8, sizeof(int),      &ne00));
-                CL_CHECK(clSetKernelArg(kernel,  9, sizeof(int),      &ne01));
-                CL_CHECK(clSetKernelArg(kernel, 10, sizeof(cl_ulong), &nb01));
-                CL_CHECK(clSetKernelArg(kernel, 11, sizeof(cl_ulong), &nb02));
-                CL_CHECK(clSetKernelArg(kernel, 12, sizeof(cl_ulong), &nb03));
-                CL_CHECK(clSetKernelArg(kernel, 13, sizeof(int),      &ne12));
-                CL_CHECK(clSetKernelArg(kernel, 14, sizeof(cl_ulong), &nb11));
-                CL_CHECK(clSetKernelArg(kernel, 15, sizeof(cl_ulong), &nb12));
-                CL_CHECK(clSetKernelArg(kernel, 16, sizeof(cl_ulong), &nb13));
-                CL_CHECK(clSetKernelArg(kernel, 17, sizeof(int),      &ne0));
-                CL_CHECK(clSetKernelArg(kernel, 18, sizeof(int),      &ne1));
-                CL_CHECK(clSetKernelArg(kernel, 19, sizeof(int),      &r2));
-                CL_CHECK(clSetKernelArg(kernel, 20, sizeof(int),      &r3));
                 break;
             }
             kernel = backend_ctx->kernel_mul_mv_q4_K_f32;
