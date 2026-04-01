@@ -881,6 +881,10 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_noshuffle_q4_k_f32;
     cl_kernel kernel_gemv_noshuffle_q6_K_f32;
     cl_kernel kernel_gemm_noshuffle_q6_K_f32;
+
+    // Apple-specific buffer-based Q4_0 GEMV (no image1d_buffer_t)
+    cl_program program_gemv_noshuffle_apple;
+    cl_kernel  kernel_gemv_q4_0_f32_apple;
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
 
     void free() {
@@ -970,7 +974,13 @@ static cl_program build_program_from_source(cl_context ctx, cl_device_id dev, co
     const bool use_no_subgroups_compat =
         compile_opts.find("GGML_OPENCL_NO_SUBGROUPS_COMPAT=1") != std::string::npos;
 
-    if (device_name.find("NVIDIA") != std::string::npos || use_no_subgroups_compat) {
+    if (device_name.find("Apple") != std::string::npos) {
+        source.insert(0, "#define APPLE_GPU 1\n");
+    }
+
+    // Also always stub subgroup builtins for Apple (OpenCL 1.2 has no cl_khr_subgroups)
+    const bool is_apple = device_name.find("Apple") != std::string::npos;
+    if (device_name.find("NVIDIA") != std::string::npos || use_no_subgroups_compat || is_apple) {
         static const char * subgroup_compat_prelude =
             "// Experimental OpenCL no-subgroups compatibility prelude\n"
             "#define NVIDIA_GPU 1\n"
@@ -2889,7 +2899,38 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
         backend_ctx->program_CL_gemv_general = build_program_from_source(
             backend_ctx->context, backend_ctx->device, kernel_src_CL_gemv_general.c_str(), CL_gemv_compile_opts);
 
-        CL_CHECK((backend_ctx->CL_mul_mat_vec_q4_0_f32_1d_4x_flat_general = clCreateKernel(backend_ctx->program_CL_gemv_general, "kernel_gemv_noshuffle", &err), err));
+        // kernel_gemv_noshuffle is excluded on Apple (#ifndef APPLE_GPU guard in .cl);
+        // Apple uses kernel_gemv_q4_0_f32_apple from program_gemv_noshuffle_apple instead.
+        if (backend_ctx->gpu_family != GPU_FAMILY::APPLE) {
+            CL_CHECK((backend_ctx->CL_mul_mat_vec_q4_0_f32_1d_4x_flat_general = clCreateKernel(backend_ctx->program_CL_gemv_general, "kernel_gemv_noshuffle", &err), err));
+        }
+        GGML_LOG_CONT(".");
+    }
+
+    // gemv_noshuffle_apple — buffer-based Q4_0 GEMV for Apple (no images, local-memory src1)
+    if (backend_ctx->gpu_family == GPU_FAMILY::APPLE) {
+        std::string CL_gemv_compile_opts = std::string("-cl-std=") + opencl_c_std +
+                                       " -cl-mad-enable "
+                                       " -DAPPLE_GPU=1 "
+                                       " -DSIMDGROUP_WIDTH=" +
+                                       std::to_string(backend_ctx->adreno_wave_size);
+        if (backend_ctx->use_no_subgroups_compat) {
+            CL_gemv_compile_opts += " -DGGML_OPENCL_NO_SUBGROUPS_COMPAT=1";
+        }
+
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src_apple {
+            #include "gemv_noshuffle_general.cl.h"
+        };
+#else
+        const std::string kernel_src_apple = read_file("gemv_noshuffle_general.cl");
+#endif
+
+        backend_ctx->program_gemv_noshuffle_apple = build_program_from_source(
+            backend_ctx->context, backend_ctx->device, kernel_src_apple.c_str(), CL_gemv_compile_opts);
+
+        CL_CHECK((backend_ctx->kernel_gemv_q4_0_f32_apple =
+            clCreateKernel(backend_ctx->program_gemv_noshuffle_apple, "kernel_gemv_noshuffle_apple", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -3201,7 +3242,11 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
         cl_program prog =
             build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), CL_moe_compile_opts);
 
-        CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q6_K_f32 = clCreateKernel(prog, "kernel_gemm_noshuffle_q6_K_f32", &err), err));
+        // kernel_gemm_noshuffle_q6_K_f32 is inside #ifdef ADRENO_GPU in the .cl file;
+        // on Apple the function is not compiled, so skip creating the handle.
+        if (backend_ctx->gpu_family != GPU_FAMILY::APPLE) {
+            CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q6_K_f32 = clCreateKernel(prog, "kernel_gemm_noshuffle_q6_K_f32", &err), err));
+        }
         GGML_LOG_CONT(".");
     }
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
@@ -3549,9 +3594,10 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
         backend_ctx->gpu_family = GPU_FAMILY::INTEL;
     } else if (strstr(dev_ctx->device_name.c_str(), "Apple") ||
                strstr(dev_ctx->platform_name.c_str(), "Apple")) {
-        GGML_LOG_WARN("ggml_opencl: treating Apple device '%s' as generic OpenCL/Intel-like for experimental support\n",
+        GGML_LOG_INFO("ggml_opencl: Apple GPU detected: '%s'\n",
             dev_ctx->device_name.c_str());
-        backend_ctx->gpu_family = GPU_FAMILY::INTEL;
+        backend_ctx->gpu_family = GPU_FAMILY::APPLE;
+        backend_ctx->adreno_wave_size = 32;  // Apple Silicon SIMD group width
     } else if (strstr(dev_ctx->device_name.c_str(), "NVIDIA") ||
                strstr(dev_ctx->platform_name.c_str(), "NVIDIA")) {
         // Experimental: route NVIDIA OpenCL devices through the existing
@@ -6700,10 +6746,12 @@ static ggml_backend_buffer_t ggml_backend_opencl_buffer_type_alloc_buffer(ggml_b
 
     cl_int err;
     cl_mem mem = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, size, NULL, &err);
+#ifndef __APPLE__
     if (err != CL_SUCCESS && backend_ctx->adreno_use_large_buffer) {
         cl_mem_properties props[] = { 0x41A6 /* CL_LARGE_BUFFER_QCOM */, 1, 0 };
         mem = clCreateBufferWithProperties(backend_ctx->context, props, CL_MEM_READ_WRITE, size, NULL, &err);
     }
+#endif
     if (err != CL_SUCCESS) {
         GGML_LOG_INFO("%s: failed to allocate %.2f MiB (err = %d, context = %p)\n",
                 __func__, size / 1024.0 / 1024.0, err, (void *) backend_ctx->context);
@@ -11521,6 +11569,41 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             }
         }
     }
+
+    // Q4_0 x fp32 — Apple buffer path (no image1d_buffer_t)
+#ifdef GGML_OPENCL_SOA_Q
+    if (src0t == GGML_TYPE_Q4_0 && src1t == GGML_TYPE_F32 &&
+        backend_ctx->gpu_family == GPU_FAMILY::APPLE && ne11 == 1) {
+        int M_a = ne01;
+        cl_kernel apple_kernel = backend_ctx->kernel_gemv_q4_0_f32_apple;
+        cl_uint k_arg = 0;
+        CL_CHECK(clSetKernelArg(apple_kernel, k_arg++, sizeof(cl_mem),   &extra0_q4_0->q));
+        CL_CHECK(clSetKernelArg(apple_kernel, k_arg++, sizeof(cl_mem),   &extra0_q4_0->d));
+        CL_CHECK(clSetKernelArg(apple_kernel, k_arg++, sizeof(cl_mem),   &extra1->data_device));
+        CL_CHECK(clSetKernelArg(apple_kernel, k_arg++, sizeof(cl_ulong), &offset1));
+        CL_CHECK(clSetKernelArg(apple_kernel, k_arg++, sizeof(cl_mem),   &extrad->data_device));
+        CL_CHECK(clSetKernelArg(apple_kernel, k_arg++, sizeof(cl_ulong), &offsetd));
+        CL_CHECK(clSetKernelArg(apple_kernel, k_arg++, sizeof(int),      &ne00));
+        CL_CHECK(clSetKernelArg(apple_kernel, k_arg++, sizeof(int),      &ne01));
+        CL_CHECK(clSetKernelArg(apple_kernel, k_arg++, sizeof(int),      &ne02));
+        CL_CHECK(clSetKernelArg(apple_kernel, k_arg++, sizeof(int),      &ne10));
+        CL_CHECK(clSetKernelArg(apple_kernel, k_arg++, sizeof(int),      &ne12));
+        CL_CHECK(clSetKernelArg(apple_kernel, k_arg++, sizeof(int),      &ne0));
+        CL_CHECK(clSetKernelArg(apple_kernel, k_arg++, sizeof(int),      &ne1));
+        CL_CHECK(clSetKernelArg(apple_kernel, k_arg++, sizeof(int),      &r2));
+        CL_CHECK(clSetKernelArg(apple_kernel, k_arg++, sizeof(int),      &r3));
+
+        size_t wavesize = (size_t)backend_ctx->adreno_wave_size;  // 32 for Apple
+        size_t global_work_size[3] = {
+            ((size_t)(M_a / 2) + wavesize - 1) / wavesize * wavesize,
+            4,  // N_SIMDGROUP
+            1
+        };
+        size_t local_work_size[3] = { wavesize, 4, 1 };
+        backend_ctx->enqueue_ndrange_kernel(apple_kernel, 3, global_work_size, local_work_size, dst);
+        return;
+    }
+#endif // GGML_OPENCL_SOA_Q
 
     if (ne01 && ne1 && use_adreno_kernels(backend_ctx, src0)) {
 
